@@ -215,5 +215,11 @@ func faviconHandler(w http.ResponseWriter, req *http.Request) {
 	fmt.Printf("%s\n", req.RequestURI)
 	w.Header().Set("Content-Type", "image/x-icon")
 	w.Header().Set("Cache-Control", "public, max-age=7776000")
-	http.ServeFile(w, req, "static/favicon.ico")
+	favicon, err := static.ReadFile("static/favicon.ico")
+	if err != nil {
+		// return 404
+		w.WriteHeader(http.StatusNotFound)
+	}
+	// return favicon
+	w.Write(favicon) // Send the favicon
 }
