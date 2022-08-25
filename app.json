@@ -1,13 +1,21 @@
 {
+    "name": "URL Shortener with a Google Spreadsheet",
+    "description": "This is a simple web server that can redirect a pre-defined set of URLs in Google Sheets. ",
     "env": {
-        "GOOGLE_SHEET_ID":{
+        "GOOGLE_SHEET_ID": {
             "description": "Provide your Sheet ID string",
             "required": true
+        },
+        "HOME_REDIRECT": {
+            "description": "Provide your home redirect URL",
+            "required": false
         }
     },
-    "hooks":{
+    "hooks": {
         "postcreate": {
-            "commands": ["./postdeploy.sh"]
+            "commands": [
+                "./postdeploy.sh"
+            ]
         }
     }
 }
