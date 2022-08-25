@@ -1,6 +1,7 @@
 package main
 
 import (
+	"embed"
 	"fmt"
 	"log"
 	"net"
@@ -11,6 +12,9 @@ import (
 	"sync"
 	"time"
 )
+
+//go:embed static/*
+var static embed.FS
 
 func main() {
 	port, addr := os.Getenv("PORT"), os.Getenv("LISTEN_ADDR")
@@ -43,6 +47,7 @@ func main() {
 		homeRedirect: homeRedirect,
 	}
 
+	http.HandleFunc("/favicon.ico", faviconHandler)
 	http.HandleFunc("/", srv.handler)
 
 	listenAddr := net.JoinHostPort(addr, port)
@@ -119,7 +124,6 @@ func (s *server) redirect(w http.ResponseWriter, req *http.Request) {
 	if req.Body != nil {
 		defer req.Body.Close()
 	}
-
 	redirTo, err := s.findRedirect(req.URL)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "failed to find redirect: %v", err)
@@ -205,4 +209,11 @@ func urlMap(in [][]interface{}) URLMap {
 func writeError(w http.ResponseWriter, code int, msg string, vals ...interface{}) {
 	w.WriteHeader(code)
 	fmt.Fprintf(w, msg, vals...)
+}
+
+func faviconHandler(w http.ResponseWriter, req *http.Request) {
+	fmt.Printf("%s\n", req.RequestURI)
+	w.Header().Set("Content-Type", "image/x-icon")
+	w.Header().Set("Cache-Control", "public, max-age=7776000")
+	http.ServeFile(w, req, "static/favicon.ico")
 }
