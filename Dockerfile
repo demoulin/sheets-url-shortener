@@ -17,7 +17,7 @@ RUN wget https://pkgs.tailscale.com/stable/${TSFILE} && \
 
 FROM gcr.io/distroless/static
 # FROM alpine:latest
-RUN apk update && apk add ca-certificates && rm -rf /var/cache/apk/*
+# RUN apk update && apk add ca-certificates && rm -rf /var/cache/apk/*
 COPY --from=compiler /src/app/a.out /server
 RUN mkdir -p /tailscale /var/run/tailscale /var/cache/tailscale /var/lib/tailscale
 COPY --from=tailscale /ts/app/tailscaled /tailscale/tailscaled
