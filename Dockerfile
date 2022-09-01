@@ -23,5 +23,5 @@ RUN mkdir -p /tailscale /var/run/tailscale /var/cache/tailscale /var/lib/tailsca
 COPY --from=tailscale /ts/app/tailscaled /tailscale/tailscaled
 COPY --from=tailscale /ts/app/tailscale /tailscale/tailscale
 
-# ENTRYPOINT ["/server"]
-CMD ["/start.sh"]
+ENTRYPOINT ["/server"]
+# CMD ["/start.sh"]
