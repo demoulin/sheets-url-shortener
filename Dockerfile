@@ -17,8 +17,9 @@ RUN wget https://pkgs.tailscale.com/stable/${TSFILE} && \
 
 FROM gcr.io/distroless/static
 COPY --from=compiler /src/app/a.out /server
-COPY --from=tailscale /ts/app/tailscaled /server/tailscaled
-COPY --from=tailscale /ts/app/tailscale /server/tailscale
-RUN mkdir -p /var/run/tailscale /var/cache/tailscale /var/lib/tailscale
+RUN mkdir -p /tailscale /var/run/tailscale /var/cache/tailscale /var/lib/tailscale
+COPY --from=tailscale /ts/app/tailscaled /tailscale/tailscaled
+COPY --from=tailscale /ts/app/tailscale /tailscale/tailscale
+
 # ENTRYPOINT ["/server"]
 CMD ["/server/start.sh"]
