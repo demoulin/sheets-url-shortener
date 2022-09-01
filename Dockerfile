@@ -2,7 +2,7 @@ FROM golang:1.19 AS compiler
 WORKDIR /src/app
 COPY go.mod go.sum ./
 RUN go mod download
-RUN go vet -v
+# RUN go vet -v
 # RUN go test -v
 COPY . ./
 RUN CGO_ENABLED=0 go build -o ./a.out .
