@@ -24,4 +24,4 @@ COPY --from=tailscale /ts/app/tailscaled /tailscale/tailscaled
 COPY --from=tailscale /ts/app/tailscale /tailscale/tailscale
 
 # ENTRYPOINT ["/server"]
-CMD ["/server/start.sh"]
+CMD ["/start.sh"]
