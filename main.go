@@ -48,6 +48,7 @@ func main() {
 	}
 
 	http.HandleFunc("/favicon.ico", faviconHandler)
+	http.HandleFunc("/robots.txt", robotsHandler)
 	http.HandleFunc("/", srv.handler)
 
 	listenAddr := net.JoinHostPort(addr, port)
@@ -222,4 +223,12 @@ func faviconHandler(w http.ResponseWriter, req *http.Request) {
 	}
 	// return favicon
 	w.Write(favicon) // Send the favicon
+}
+
+func robotsHandler(w http.ResponseWriter, req *http.Request) {
+	fmt.Printf("%s\n", req.RequestURI)
+	w.Header().Set("Content-Type", "text/plain")
+	w.Header().Set("Cache-Control", "public, max-age=7776000")
+	robots := "User-agent: *\nDisallow: /"
+	w.Write([]byte(robots)) // Send the robots.txt
 }

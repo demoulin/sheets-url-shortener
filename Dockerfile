@@ -10,8 +10,8 @@ RUN CGO_ENABLED=0 go build -o ./a.out .
 FROM alpine:latest as tailscale
 WORKDIR /ts/app
 # COPY . ./
-ENV TSFILE=tailscale_1.30.0_amd64.tgz
-RUN wget https://pkgs.tailscale.com/stable/${TSFILE} && \
+ENV TSFILE=tailscale_1.31.101_amd64.tgz
+RUN wget https://pkgs.tailscale.com/unstable/${TSFILE} && \
   tar xzf ${TSFILE} --strip-components=1
 # COPY . ./
 
