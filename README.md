@@ -14,7 +14,7 @@ following, and deploy a simple app just by clicking around.
 for **free** thanks to [generous free tier][free tier] (+Google Sheets is free
 with a Gmail account as well).
 
-[free tier]: https://cloud.google.com/run/pricing
+[free tier]: https://cloud.google.com/run/pricing 
 
 This redirector also supports path additions on top of base URLs, for example,
 with the sheet row:
@@ -22,9 +22,6 @@ with the sheet row:
 | shortcut | url |
 |----|---|
 | `gcp` | `https://github.com/GoogleCloudPlatform` |
-
-The `go.ahmet.dev/gcp/golang-samples` will be redirected to
-`https://github.com/GoogleCloudPlatform/golang-samples`.
 
 ## Setup
 
