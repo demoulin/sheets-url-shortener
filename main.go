@@ -3,6 +3,7 @@ package main
 import (
 	"embed"
 	"fmt"
+	"io"
 	"log"
 	"net"
 	"net/http"
@@ -113,7 +114,7 @@ func (s *server) home(w http.ResponseWriter, req *http.Request) {
 	}
 
 	w.WriteHeader(http.StatusNotFound)
-	fmt.Fprintf(w, `<!DOCTYPE html>
+	_, _ = fmt.Fprintf(w, `<!DOCTYPE html>
 	<html><head><title>Not found</title></head><body><h1>Not found :(</h1>
 	<p>This is home page for a URL redirector service.</p>
 	<p>The URL is missing the shortcut in the path.</p>
@@ -123,7 +124,9 @@ func (s *server) home(w http.ResponseWriter, req *http.Request) {
 func (s *server) redirect(w http.ResponseWriter, req *http.Request) {
 
 	if req.Body != nil {
-		defer req.Body.Close()
+		defer func(Body io.ReadCloser) {
+			_ = Body.Close()
+		}(req.Body)
 	}
 	redirTo, err := s.findRedirect(req.URL)
 	if err != nil {
@@ -132,7 +135,7 @@ func (s *server) redirect(w http.ResponseWriter, req *http.Request) {
 	}
 	if redirTo == nil {
 		w.WriteHeader(http.StatusNotFound)
-		fmt.Fprintf(w, "404 not found")
+		_, _ = fmt.Fprintf(w, "404 not found")
 		return
 	}
 
@@ -209,7 +212,7 @@ func urlMap(in [][]interface{}) URLMap {
 
 func writeError(w http.ResponseWriter, code int, msg string, vals ...interface{}) {
 	w.WriteHeader(code)
-	fmt.Fprintf(w, msg, vals...)
+	_, _ = fmt.Fprintf(w, msg, vals...)
 }
 
 func faviconHandler(w http.ResponseWriter, req *http.Request) {
@@ -222,7 +225,7 @@ func faviconHandler(w http.ResponseWriter, req *http.Request) {
 		w.WriteHeader(http.StatusNotFound)
 	}
 	// return favicon
-	w.Write(favicon) // Send the favicon
+	_, _ = w.Write(favicon) // Send the favicon
 }
 
 func robotsHandler(w http.ResponseWriter, req *http.Request) {
@@ -230,5 +233,5 @@ func robotsHandler(w http.ResponseWriter, req *http.Request) {
 	w.Header().Set("Content-Type", "text/plain")
 	w.Header().Set("Cache-Control", "public, max-age=7776000")
 	robots := "User-agent: *\nDisallow: /"
-	w.Write([]byte(robots)) // Send the robots.txt
+	_, _ = w.Write([]byte(robots)) // Send the robots.txt
 }
