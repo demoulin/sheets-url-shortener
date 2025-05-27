@@ -184,21 +184,26 @@ func securityHeadersMiddleware(next http.Handler) http.Handler {
 	})
 }
 
-var limiter *rate.Limiter
+var limiter *rate.Limiter // Global limiter instance, initialized in main()
 
-// rateLimitMiddleware applies rate limiting to incoming requests.
-func rateLimitMiddleware(next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if limiter != nil { // Check if rate limiting is enabled
+// newRateLimitMiddleware creates a middleware for rate limiting.
+// If the provided limiter is nil, the middleware is a pass-through.
+func newRateLimitMiddleware(limiter *rate.Limiter) func(http.Handler) http.Handler {
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if limiter == nil { // Check if rate limiting was disabled (limiter not initialized)
+				next.ServeHTTP(w, r)
+				return
+			}
 			if !limiter.Allow() {
 				// Optionally log the rate-limited request here.
-				// log.Printf("Request rate-limited: %s %s from %s", r.Method, r.URL.Path, r.RemoteAddr)
+				// log.Printf("Rate limited request from %s to %s", r.RemoteAddr, r.URL.Path)
 				http.Error(w, "Too Many Requests", http.StatusTooManyRequests)
 				return
 			}
-		}
-		next.ServeHTTP(w, r)
-	})
+			next.ServeHTTP(w, r)
+		})
+	}
 }
 
 var errorClient *errorreporting.Client
@@ -332,8 +337,11 @@ func main() {
 	mux.HandleFunc("/robots.txt", robotsHandler)
 	mux.HandleFunc("/", appServer.handler) // Use appServer.handler
 
+	// Create the rate limiting middleware instance using the factory
+	rateLimitMwInstance := newRateLimitMiddleware(limiter)
+
 	// Apply middlewares: rate limiting -> security -> otel -> mux
-	finalHandler := rateLimitMiddleware(securityHeadersMiddleware(otelMiddleware(mux)))
+	finalHandler := rateLimitMwInstance(securityHeadersMiddleware(otelMiddleware(mux)))
 
 	listenAddr := net.JoinHostPort(cfg.ListenAddr, cfg.Port) // Use config values
 

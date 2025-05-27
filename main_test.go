@@ -115,14 +115,17 @@ func newTestServerWithConfig(t *testing.T, provider URLProvider, cfgOverrides *C
 	mux.HandleFunc("/", testAppServer.handler)
 	// We can add favicon/robots if needed for specific tests, but usually not for core logic.
 
-	// Ensure global 'limiter' is correctly set or nilled based on baseCfg.RateLimitEnabled
+	// Create a local limiter for this specific test server instance
+	var testSpecificLimiter *rate.Limiter
 	if baseCfg.RateLimitEnabled {
-		limiter = rate.NewLimiter(rate.Limit(baseCfg.RateLimitRPS), baseCfg.RateLimitBurst)
-	} else {
-		limiter = nil
+		testSpecificLimiter = rate.NewLimiter(rate.Limit(baseCfg.RateLimitRPS), baseCfg.RateLimitBurst)
 	}
+	// The global 'limiter' variable is not modified by this test helper.
 
-	finalHandler := rateLimitMiddleware(securityHeadersMiddleware(otelMiddleware(mux)))
+	// Create rate limit middleware instance using the factory with the local limiter
+	rateLimitMwInstance := newRateLimitMiddleware(testSpecificLimiter)
+
+	finalHandler := rateLimitMwInstance(securityHeadersMiddleware(otelMiddleware(mux)))
 	return httptest.NewServer(finalHandler)
 }
 
