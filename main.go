@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"embed"
 	"fmt"
 	"io"
@@ -32,7 +33,7 @@ func main() {
 	if ttlVal != "" {
 		v, err := time.ParseDuration(ttlVal)
 		if err != nil {
-			log.Fatalf("failed to parse CACHE_TTL as duration: %v", err)
+			log.Fatalf("failed to parse CACHE_TTL as duration: %w", err)
 		}
 		ttl = v
 	}
@@ -76,7 +77,7 @@ type cachedURLMap struct {
 
 func (c *cachedURLMap) Get(query string) (*url.URL, error) {
 	if err := c.refresh(); err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed to refresh cache: %w", err)
 	}
 	c.RLock()
 	defer c.RUnlock()
@@ -90,9 +91,9 @@ func (c *cachedURLMap) refresh() error {
 		return nil
 	}
 
-	rows, err := c.sheet.Query()
+	rows, err := c.sheet.Query(context.Background())
 	if err != nil {
-		return err
+		return fmt.Errorf("failed to query sheet: %w", err)
 	}
 	c.v = urlMap(rows)
 	c.lastUpdate = time.Now()
@@ -130,7 +131,7 @@ func (s *server) redirect(w http.ResponseWriter, req *http.Request) {
 	}
 	redirTo, err := s.findRedirect(req.URL)
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, "failed to find redirect: %v", err)
+		writeError(w, http.StatusInternalServerError, "failed to find redirect: %w", err)
 		return
 	}
 	if redirTo == nil {
@@ -152,7 +153,7 @@ func (s *server) findRedirect(req *url.URL) (*url.URL, error) {
 		query := strings.Join(segments, "/")
 		v, err := s.db.Get(query)
 		if err != nil {
-			return nil, err
+			return nil, fmt.Errorf("failed to get URL from cache for query %q: %w", query, err)
 		}
 		if v != nil {
 			return prepRedirect(v, strings.Join(discard, "/"), req.Query()), nil
@@ -216,20 +217,18 @@ func writeError(w http.ResponseWriter, code int, msg string, vals ...interface{}
 }
 
 func faviconHandler(w http.ResponseWriter, req *http.Request) {
-	fmt.Printf("%s\n", req.RequestURI)
 	w.Header().Set("Content-Type", "image/x-icon")
 	w.Header().Set("Cache-Control", "public, max-age=7776000")
 	favicon, err := static.ReadFile("static/favicon.ico")
 	if err != nil {
-		// return 404
-		w.WriteHeader(http.StatusNotFound)
+		log.Printf("failed to read favicon.ico: %v", err) // Optional: log the error
+		http.Error(w, "favicon not found", http.StatusNotFound)
+		return
 	}
-	// return favicon
 	_, _ = w.Write(favicon) // Send the favicon
 }
 
 func robotsHandler(w http.ResponseWriter, req *http.Request) {
-	fmt.Printf("%s\n", req.RequestURI)
 	w.Header().Set("Content-Type", "text/plain")
 	w.Header().Set("Cache-Control", "public, max-age=7776000")
 	robots := "User-agent: *\nDisallow: /"

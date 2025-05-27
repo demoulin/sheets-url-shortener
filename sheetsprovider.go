@@ -13,14 +13,14 @@ type sheetsProvider struct {
 	sheetName      string
 }
 
-func (s *sheetsProvider) Query() ([][]interface{}, error) {
+func (s *sheetsProvider) Query(ctx context.Context) ([][]interface{}, error) {
 	if s.googleSheetsID == "" {
 		return nil, fmt.Errorf("GOOGLE_SHEET_ID not set")
 	}
 
-	srv, err := sheets.NewService(context.TODO())
+	srv, err := sheets.NewService(ctx)
 	if err != nil {
-		return nil, fmt.Errorf("unable to retrieve Sheets client: %v", err)
+		return nil, fmt.Errorf("unable to retrieve Sheets client: %w", err)
 	}
 
 	log.Println("querying sheet")
@@ -30,7 +30,7 @@ func (s *sheetsProvider) Query() ([][]interface{}, error) {
 	}
 	resp, err := srv.Spreadsheets.Values.Get(s.googleSheetsID, readRange).Do()
 	if err != nil {
-		return nil, fmt.Errorf("unable to retrieve data from sheet: %v", err)
+		return nil, fmt.Errorf("unable to retrieve data from sheet: %w", err)
 	}
 	log.Printf("queried %d rows", len(resp.Values))
 	return resp.Values, nil
