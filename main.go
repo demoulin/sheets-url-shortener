@@ -283,11 +283,7 @@ func main() {
 	if err != nil {
 		log.Fatalf("failed to initialize OpenTelemetry tracer: %v", err)
 	}
-	defer func() {
-		if errShutdown := tp.Shutdown(ctx); errShutdown != nil { // Use ctx from main
-			log.Printf("Error shutting down tracer provider: %v", errShutdown)
-		}
-	}()
+	// Deferral for tp.Shutdown will be handled explicitly later with shutdownCtx
 
 	if err := initErrorReporting(ctx, cfg.ProjectID, cfg.OtelServiceName, cfg.ServiceVersion); err != nil {
 		// Log non-fatally, as the app might still be able to run, but error reporting will be disabled.
@@ -390,7 +386,17 @@ func main() {
 	// or might not respect the serverShutdownTimeout.
 	// Let's proceed with the current defer structure and acknowledge this as a potential refinement.
 
-	log.Println("Resources being cleaned up via deferred calls. Exiting.")
+	// Explicitly shut down the OpenTelemetry Tracer Provider
+	log.Println("Shutting down OpenTelemetry Tracer Provider...")
+	if err := tp.Shutdown(shutdownCtx); err != nil { // Use shutdownCtx here
+		log.Printf("OpenTelemetry Tracer Provider shutdown failed: %v", err)
+		// Use context.Background() for reporting this error as shutdownCtx might be done.
+		reportError(context.Background(), fmt.Errorf("tracer provider shutdown failed: %w", err), nil)
+	} else {
+		log.Println("OpenTelemetry Tracer Provider gracefully stopped.")
+	}
+
+	log.Println("Resources being cleaned up via deferred calls (Error Reporting). Exiting.")
 }
 
 type server struct {
