@@ -11,31 +11,24 @@ RUN apk add --no-cache ca-certificates tzdata && \
   update-ca-certificates && \
   addgroup -S appgroup && adduser -S appuser -G appgroup
 
-# OpenTelemetry Environment Variable Examples:
-# These are typically injected by the runtime environment (e.g., Cloud Run),
-# but are listed here for reference.
+# --- OpenTelemetry Configuration ---
+# While the OpenTelemetry SDK defines standard environment variables for configuration,
+# this application uses the following for more direct control via its Viper config:
 #
-# ENV OTEL_SERVICE_NAME="url-shortener"
+# ENV OTEL_SERVICE_NAME="url-shortener" (Set via Viper: OTEL_SERVICE_NAME)
+# ENV OTEL_EXPORTER_OTLP_ENDPOINT="http://localhost:4318" (Set via Viper: OTEL_EXPORTER_OTLP_ENDPOINT)
+# ENV OTEL_EXPORTER_OTLP_PROTOCOL="http/protobuf" (Set via Viper: OTEL_EXPORTER_OTLP_PROTOCOL)
 #
-# # OTLP Exporter Configuration (choose one protocol)
-# # For OTLP/HTTP (protobuf) - typically on port 4318
-# ENV OTEL_EXPORTER_OTLP_ENDPOINT="http://localhost:4318"
-# ENV OTEL_EXPORTER_OTLP_PROTOCOL="http/protobuf"
-# # ENV OTEL_EXPORTER_OTLP_HEADERS="key1=value1,key2=value2" # Optional custom headers
-# # ENV OTEL_EXPORTER_OTLP_TIMEOUT="10000" # Optional timeout in milliseconds
-# # ENV OTEL_EXPORTER_OTLP_COMPRESSION="gzip" # Optional compression: "gzip" or "none"
+# For SAMPLING, this application uses specific settings configured via Viper:
+# ENV OTEL_SAMPLER_TYPE="always_on" (Options: "always_on", "always_off", "traceid_ratio")
+# ENV OTEL_SAMPLER_ARG="1.0" (Argument for sampler, e.g., ratio for "traceid_ratio")
 #
-# # For OTLP/gRPC - typically on port 4317
-# # ENV OTEL_EXPORTER_OTLP_ENDPOINT="http://localhost:4317" # Note: some SDKs might expect just "localhost:4317"
-# # ENV OTEL_EXPORTER_OTLP_PROTOCOL="grpc"
-# # ENV OTEL_EXPORTER_OTLP_INSECURE="true" # For local testing without TLS for gRPC
-#
-# # Sampler Configuration (example: trace 10% of requests)
-# # ENV OTEL_TRACES_SAMPLER="traceidratio"
-# # ENV OTEL_TRACES_SAMPLER_ARG="0.10"
-#
-# # For more details on standard OpenTelemetry environment variables, see:
-# # https://github.com/open-telemetry/opentelemetry-specification/blob/main/specification/sdk-environment-variables.md
+# The standard OTEL_TRACES_SAMPLER and OTEL_TRACES_SAMPLER_ARG environment variables
+# might still be respected by some SDK auto-instrumentation layers if not overridden
+# by this application's programmatic setup, but the application's Viper configuration
+# for OTEL_SAMPLER_TYPE and OTEL_SAMPLER_ARG takes precedence for the main tracer provider.
+# For more details on standard OTel env vars:
+# https://opentelemetry.io/docs/specs/otel/configuration/sdk-environment-variables/
 
 COPY --chown=appuser:appgroup --from=compiler /src/app/a.out /server
 USER appuser

@@ -51,6 +51,8 @@ type Config struct {
 	RateLimitRPS             float64 `mapstructure:"RATE_LIMIT_RPS"`
 	RateLimitBurst           int    `mapstructure:"RATE_LIMIT_BURST"`
 	SheetQueryTimeout        string `mapstructure:"SHEET_QUERY_TIMEOUT"`
+	OtelSamplerType          string `mapstructure:"OTEL_SAMPLER_TYPE"`
+	OtelSamplerArg           float64 `mapstructure:"OTEL_SAMPLER_ARG"`
 }
 
 // loadConfig reads configuration from environment variables and viper defaults.
@@ -75,6 +77,8 @@ func loadConfig() (*Config, error) {
 	v.SetDefault("RATE_LIMIT_RPS", 10.0)
 	v.SetDefault("RATE_LIMIT_BURST", 20)
 	v.SetDefault("SHEET_QUERY_TIMEOUT", "15s")
+	v.SetDefault("OTEL_SAMPLER_TYPE", "always_on") // Default sampler
+	v.SetDefault("OTEL_SAMPLER_ARG", 1.0)          // Default sampler argument (e.g., for ratio based)
 
 	// Bind environment variables explicitly (optional if using AutomaticEnv and matching struct fields,
 	// but good for clarity and when mapstructure tags are used)
@@ -93,8 +97,8 @@ func loadConfig() (*Config, error) {
 var static embed.FS
 
 // initTracer configures and registers the OpenTelemetry SDK components.
-// It now accepts OpenTelemetry specific configuration.
-func initTracer(otelServiceName, otelExporterEndpoint, otelExporterProtocol string) (*sdktrace.TracerProvider, error) {
+// It now accepts OpenTelemetry specific configuration including sampler settings.
+func initTracer(otelServiceName, otelExporterEndpoint, otelExporterProtocol, samplerType string, samplerArg float64) (*sdktrace.TracerProvider, error) {
 	ctx := context.Background()
 
 	var clientOpts []otlptracehttp.Option
@@ -124,15 +128,37 @@ func initTracer(otelServiceName, otelExporterEndpoint, otelExporterProtocol stri
 		return nil, fmt.Errorf("failed to create resource: %w", err)
 	}
 
+	// Select sampler based on configuration
+	var sampler sdktrace.Sampler
+	switch strings.ToLower(samplerType) {
+	case "always_on", "alwayson":
+		sampler = sdktrace.AlwaysSample()
+		log.Println("Using AlwaysSample OpenTelemetry sampler")
+	case "always_off", "alwaysoff":
+		sampler = sdktrace.NeverSample()
+		log.Println("Using NeverSample OpenTelemetry sampler")
+	case "traceid_ratio", "traceidratio":
+		if samplerArg >= 0.0 && samplerArg <= 1.0 {
+			sampler = sdktrace.TraceIDRatioBased(samplerArg)
+			log.Printf("Using TraceIDRatioBased OpenTelemetry sampler with ratio %f", samplerArg)
+		} else {
+			log.Printf("Invalid OTEL_SAMPLER_ARG for traceid_ratio: %f. Defaulting to AlwaysSample.", samplerArg)
+			sampler = sdktrace.AlwaysSample()
+		}
+	default:
+		log.Printf("Unknown OTEL_SAMPLER_TYPE: %s. Defaulting to AlwaysSample.", samplerType)
+		sampler = sdktrace.AlwaysSample()
+	}
+
 	tp := sdktrace.NewTracerProvider(
 		sdktrace.WithBatcher(exporter),
 		sdktrace.WithResource(res),
-		sdktrace.WithSampler(sdktrace.AlwaysSample()),
+		sdktrace.WithSampler(sampler), // Use the configured sampler
 	)
 	otel.SetTracerProvider(tp)
 
-	log.Printf("OpenTelemetry Tracer initialized. Service: %s, Endpoint: %s, Protocol: %s",
-		otelServiceName, otelExporterEndpoint, otelExporterProtocol)
+	log.Printf("OpenTelemetry Tracer initialized. Service: %s, Endpoint: %s, Protocol: %s, Sampler: %s, SamplerArg: %.2f",
+		otelServiceName, otelExporterEndpoint, otelExporterProtocol, samplerType, samplerArg)
 	return tp, nil
 }
 
@@ -241,6 +267,8 @@ func main() {
 	log.Printf("Rate Limiting RPS: %.2f", cfg.RateLimitRPS)
 	log.Printf("Rate Limiting Burst: %d", cfg.RateLimitBurst)
 	log.Printf("Sheet Query Timeout: %s", cfg.SheetQueryTimeout)
+	log.Printf("OTel Sampler Type: %s", cfg.OtelSamplerType)
+	log.Printf("OTel Sampler Arg: %.2f", cfg.OtelSamplerArg)
 	log.Println("-----------------------------")
 
 	// Initialize the rate limiter if enabled
@@ -251,7 +279,7 @@ func main() {
 		log.Println("Rate limiting disabled by configuration.")
 	}
 
-	tp, err := initTracer(cfg.OtelServiceName, cfg.OtelExporterOtlpEndpoint, cfg.OtelExporterOtlpProtocol)
+	tp, err := initTracer(cfg.OtelServiceName, cfg.OtelExporterOtlpEndpoint, cfg.OtelExporterOtlpProtocol, cfg.OtelSamplerType, cfg.OtelSamplerArg)
 	if err != nil {
 		log.Fatalf("failed to initialize OpenTelemetry tracer: %v", err)
 	}
