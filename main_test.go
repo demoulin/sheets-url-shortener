@@ -2,12 +2,16 @@ package main
 
 import (
 	"context"
+	"fmt"     // For TestRedirectProviderError, TestRedirectCache
+	"io"      // For TestHomeDefaultNotFound, TestRedirectNotFound
 	"net/http"
 	"net/http/httptest"
-	// "net/url" // Will be needed for specific test cases later
-	// "strings" // Will be needed for specific test cases later
+	"net/url" // For TestRedirectQueryParameters
+	"strings" // For TestHomeDefaultNotFound, TestRedirectPathAppending (though path joining logic might remove direct need)
 	"testing"
 	"time"
+
+	"golang.org/x/time/rate" // For limiter setup
 )
 
 // mockSheetsProvider is a mock implementation of the URLProvider interface.
@@ -26,102 +30,118 @@ func (m *mockSheetsProvider) Query(ctx context.Context) ([][]interface{}, error)
 	return m.mockData, nil
 }
 
-// newTestServer sets up a test HTTP server with a given URLProvider and optional home redirect.
+// newTestServerWithConfig sets up a test HTTP server with a given URLProvider and a specific Config.
 // It tries to mimic the main server setup including middlewares.
-func newTestServer(t *testing.T, provider URLProvider, homeRedirectURL ...string) *httptest.Server {
+func newTestServerWithConfig(t *testing.T, provider URLProvider, cfgOverrides *Config) *httptest.Server {
 	t.Helper()
 
-	// Use a minimal config for tests, relying on Viper defaults where possible.
-	// Override specific values if necessary for test behavior.
-	testCfg := &Config{ // Renamed to avoid conflict with global cfg if any
-		Port:                     "8080", // Default, not used by httptest
-		CacheTTL:                 "1s",   // Short TTL for cache testing if needed, otherwise less critical
-		SheetQueryTimeout:        "500ms", // Short timeout for sheet queries in tests
+	// Start with default-like config, then apply overrides
+	baseCfg := &Config{
+		Port:                     "8080",
+		CacheTTL:                 "1s", // Default for most tests
+		SheetQueryTimeout:        "500ms",
 		OtelServiceName:          "test-url-shortener",
-		OtelExporterOtlpEndpoint: "localhost:4318", // Standard, though likely not hit in tests
+		OtelExporterOtlpEndpoint: "localhost:4318",
 		OtelExporterOtlpProtocol: "http/protobuf",
 		ServiceVersion:           "test",
 		ServerShutdownTimeout:    "1s",
-		RateLimitEnabled:         false, // Disable rate limiting for most tests unless testing it specifically
-		// Other fields like GoogleSheetID, ProjectID can be empty if not directly used by core logic being tested
-	}
-	if len(homeRedirectURL) > 0 && homeRedirectURL[0] != "" {
-		testCfg.HomeRedirect = homeRedirectURL[0]
+		RateLimitEnabled:         false, // Default to disabled for tests
+		RateLimitRPS:             10,    // Default RPS if enabled
+		RateLimitBurst:           20,    // Default Burst if enabled
+		// Other fields like GoogleSheetID, ProjectID, HomeRedirect are empty by default
 	}
 
+	isRateLimitConfigPresentInOverrides := false
+	if cfgOverrides != nil {
+		if cfgOverrides.CacheTTL != "" {
+			baseCfg.CacheTTL = cfgOverrides.CacheTTL
+		}
+		if cfgOverrides.SheetQueryTimeout != "" {
+			baseCfg.SheetQueryTimeout = cfgOverrides.SheetQueryTimeout
+		}
+		if cfgOverrides.HomeRedirect != "" {
+			baseCfg.HomeRedirect = cfgOverrides.HomeRedirect
+		}
+		
+		// Check if RateLimitEnabled is explicitly set in overrides
+		// This requires a bit of a workaround if cfgOverrides is a partially filled struct,
+		// as a zero-value 'false' for RateLimitEnabled is ambiguous.
+		// For this refactor, we'll assume if cfgOverrides is passed, its RateLimitEnabled value is intentional.
+		// A better way would be to use pointers for boolean/numeric fields in cfgOverrides if more granularity is needed.
+		// For simplicity now: if cfgOverrides is not nil, we check its RateLimitEnabled field.
+		// This means if you pass cfgOverrides, you must specify RateLimitEnabled if you want it to be different from baseCfg's default.
+		// Or, more simply, we can say that if cfgOverrides is present, its RateLimitEnabled field dictates the value.
+		isRateLimitConfigPresentInOverrides = true // Assume if cfgOverrides is not nil, rate limit config is considered
+		baseCfg.RateLimitEnabled = cfgOverrides.RateLimitEnabled
 
-	// Parse durations
-	cacheTTL, err := time.ParseDuration(testCfg.CacheTTL)
+		if baseCfg.RateLimitEnabled {
+			// Only use RPS/Burst from overrides if they are positive, otherwise use baseCfg defaults
+			if cfgOverrides.RateLimitRPS > 0 {
+				baseCfg.RateLimitRPS = cfgOverrides.RateLimitRPS
+			}
+			if cfgOverrides.RateLimitBurst > 0 {
+				baseCfg.RateLimitBurst = cfgOverrides.RateLimitBurst
+			}
+		}
+		// Add other overrides as needed, e.g., GoogleSheetID, SheetName for specific tests
+	}
+    // If cfgOverrides was nil, isRateLimitConfigPresentInOverrides remains false,
+    // so baseCfg.RateLimitEnabled (defaulting to false) is used.
+
+	// Parse durations from baseCfg
+	cacheTTL, err := time.ParseDuration(baseCfg.CacheTTL)
 	if err != nil {
-		t.Fatalf("Failed to parse CacheTTL for test server: %v", err)
+		t.Fatalf("Failed to parse CacheTTL ('%s') for test server: %v", baseCfg.CacheTTL, err)
 	}
-	sheetQueryTimeout, err := time.ParseDuration(testCfg.SheetQueryTimeout)
+	sheetQueryTimeout, err := time.ParseDuration(baseCfg.SheetQueryTimeout)
 	if err != nil {
-		t.Fatalf("Failed to parse SheetQueryTimeout for test server: %v", err)
+		t.Fatalf("Failed to parse SheetQueryTimeout ('%s') for test server: %v", baseCfg.SheetQueryTimeout, err)
 	}
-
-	// Initialize components as in main() but with mocks/test configs
-	// No need to initialize actual OTel, Error Reporting, Rate Limiter for unit/core logic tests
-	// unless those specific features are being tested.
-	// For core redirect logic, these can be simplified or nilled out if their setup is complex
-	// and not relevant to the redirect itself.
 
 	// Initialize cachedURLMap with the mock provider
 	testCachedURLMap := &cachedURLMap{
 		ttl:               cacheTTL,
 		sheetQueryTimeout: sheetQueryTimeout,
 		sheet:             provider,
-		// v and lastUpdate will be initialized on first refresh
 	}
 
 	// Create server instance
 	testAppServer := &server{
 		db:           testCachedURLMap,
-		homeRedirect: testCfg.HomeRedirect, // Use from testCfg
+		homeRedirect: baseCfg.HomeRedirect,
 	}
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", testAppServer.handler)
-	// Favicon and robots can be ignored for core redirect tests or added if full coverage is desired
-	// mux.HandleFunc("/favicon.ico", faviconHandler)
-	// mux.HandleFunc("/robots.txt", robotsHandler)
+	// We can add favicon/robots if needed for specific tests, but usually not for core logic.
 
-	// Apply middlewares - for integration tests, it's good to include them.
-	// For pure unit tests of srv.handler, one might pass testAppServer.handler directly.
-	// Here, we'll include them to be closer to the real setup.
-	// Note: otelMiddleware, securityHeadersMiddleware, rateLimitMiddleware are from main.go
-	
-	// Simplified middleware chain for testing core redirect logic;
-	// OTel and Rate Limiting might add noise or require more setup if fully enabled.
-	// For now, let's test the core handler logic, then consider adding middlewares.
-	// finalHandler := rateLimitMiddleware(securityHeadersMiddleware(otelMiddleware(mux)))
-	// If otel.Tracer() is called directly in handlers, ensure it doesn't panic if OTel SDK is not fully init.
-	// For these tests, we are not initializing the global OTel tracer provider or error client.
-	// The production code's initTracer and initErrorReporting are not called.
-	// This means calls to otel.Tracer() will get a no-op tracer.
-	// Calls to reportError() will log "Error reporting is not initialized" if errorClient is nil.
-
-	// Using a simplified chain for now to focus on redirect logic.
-	// If middlewares are essential to the redirect logic being tested, they should be included.
-	// For this initial test, let's use a simpler chain, perhaps only the core handler.
-	// For a more "integration" style test, the full chain is better.
-	// Let's assume the middlewares don't fundamentally change the redirect for now.
-	// We can pass testAppServer.handler directly if we want to unit test just the handler.
-	// Or pass the mux if we want to test routing by the mux.
-	
-	// Let's use the full chain to be closer to production, assuming no-op OTel/Error Reporting is fine.
-	// Ensure global 'limiter' is nil or rate limiting is disabled in testCfg for tests not focusing on it.
-	if testCfg.RateLimitEnabled {
-		limiter = rate.NewLimiter(rate.Limit(testCfg.RateLimitRPS), testCfg.RateLimitBurst)
+	// Ensure global 'limiter' is correctly set or nilled based on baseCfg.RateLimitEnabled
+	if baseCfg.RateLimitEnabled {
+		limiter = rate.NewLimiter(rate.Limit(baseCfg.RateLimitRPS), baseCfg.RateLimitBurst)
 	} else {
-		limiter = nil // Ensure limiter is nil if disabled for tests
+		limiter = nil
 	}
 
-
 	finalHandler := rateLimitMiddleware(securityHeadersMiddleware(otelMiddleware(mux)))
-
-
 	return httptest.NewServer(finalHandler)
+}
+
+// newTestServer is a simplified wrapper around newTestServerWithConfig for common test cases.
+// It defaults to rate-limiting disabled and allows easy overriding of HomeRedirect.
+func newTestServer(t *testing.T, provider URLProvider, homeRedirectURL ...string) *httptest.Server {
+	t.Helper()
+	var overrides Config // Use a concrete Config struct for overrides
+
+	// Default to RateLimitEnabled = false for this simple helper
+	overrides.RateLimitEnabled = false
+
+	if len(homeRedirectURL) > 0 && homeRedirectURL[0] != "" {
+		overrides.HomeRedirect = homeRedirectURL[0]
+	}
+	
+	// If a test needs specific rate limiting or other complex config, it should use newTestServerWithConfig directly
+	// and set RateLimitEnabled = true in its cfgOverrides.
+	return newTestServerWithConfig(t, provider, &overrides)
 }
 
 // TestRedirectSuccess is a basic test for a successful redirect.
