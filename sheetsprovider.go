@@ -5,7 +5,11 @@ import (
 	"fmt"
 	"log"
 
+	"google.golang.org/api/option" // Added for option.WithContext
 	"google.golang.org/api/sheets/v4"
+
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
 )
 
 type sheetsProvider struct {
@@ -13,25 +17,48 @@ type sheetsProvider struct {
 	sheetName      string
 }
 
-func (s *sheetsProvider) Query() ([][]interface{}, error) {
+func (s *sheetsProvider) Query(ctx context.Context) ([][]interface{}, error) {
+	tracer := otel.Tracer("url-shortener/sheetsprovider")
+	ctx, span := tracer.Start(ctx, "sheetsProvider.Query")
+	defer span.End()
+
+	span.SetAttributes(
+		attribute.String("google_sheet_id", s.googleSheetsID),
+		attribute.String("sheet_name", s.sheetName),
+	)
+
 	if s.googleSheetsID == "" {
-		return nil, fmt.Errorf("GOOGLE_SHEET_ID not set")
+		err := fmt.Errorf("GOOGLE_SHEET_ID not set")
+		span.RecordError(err)
+		// span.SetStatus(codes.Error, err.Error()) // Option B for error status
+		return nil, err
 	}
 
-	srv, err := sheets.NewService(context.TODO())
+	// The context passed to NewService is used for authentication and other setup.
+	// For tracing individual HTTP calls made by the sheets service, one would typically
+	// instrument the http.Client used by the service via option.WithHTTPClient.
+	srv, err := sheets.NewService(ctx)
 	if err != nil {
-		return nil, fmt.Errorf("unable to retrieve Sheets client: %v", err)
+		wrappedErr := fmt.Errorf("unable to retrieve Sheets client: %w", err)
+		span.RecordError(wrappedErr)
+		return nil, wrappedErr
 	}
 
-	log.Println("querying sheet")
+	log.Println("querying sheet") // This log is within the span
 	readRange := "A:B"
 	if s.sheetName != "" {
 		readRange = s.sheetName + "!" + readRange
 	}
-	resp, err := srv.Spreadsheets.Values.Get(s.googleSheetsID, readRange).Do()
+
+	// Use the passed-in context (which may have a timeout) for the Do call.
+	resp, err := srv.Spreadsheets.Values.Get(s.googleSheetsID, readRange).Do(option.WithContext(ctx))
 	if err != nil {
-		return nil, fmt.Errorf("unable to retrieve data from sheet: %v", err)
+		wrappedErr := fmt.Errorf("unable to retrieve data from sheet: %w", err)
+		span.RecordError(wrappedErr)
+		return nil, wrappedErr
 	}
-	log.Printf("queried %d rows", len(resp.Values))
+
+	span.SetAttributes(attribute.Int("rows_returned", len(resp.Values)))
+	log.Printf("queried %d rows", len(resp.Values)) // This log is also within the span
 	return resp.Values, nil
 }
