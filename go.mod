@@ -1,6 +1,6 @@
 module github.com/ahmetb/serverless-url-shortener
 
-go 1.26.0
+go 1.26.3
 
 require google.golang.org/api v0.279.0
 

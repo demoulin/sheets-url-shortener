@@ -1,4 +1,4 @@
-FROM docker.io/golang:1.26 AS compiler
+FROM docker.io/golang:1.26.3 AS compiler
 WORKDIR /src/app
 COPY go.mod go.sum ./
 COPY main.go sheetsprovider.go ./
