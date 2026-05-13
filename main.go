@@ -13,6 +13,7 @@ import (
 	"os/signal"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 )
@@ -21,6 +22,9 @@ import (
 var static embed.FS
 
 func main() {
+	// JSON logs so Cloud Logging can parse structured fields.
+	slog.SetDefault(slog.New(slog.NewJSONHandler(os.Stdout, nil)))
+
 	port := os.Getenv("PORT")
 	if port == "" {
 		port = "8080"
@@ -52,6 +56,7 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
 	defer stop()
 
+	// Start async — server is ready to accept requests immediately.
 	cache.start(ctx)
 
 	srv := &server{db: cache, homeRedirect: homeRedirect}
@@ -64,8 +69,11 @@ func main() {
 
 	listenAddr := net.JoinHostPort(addr, port)
 	httpSrv := &http.Server{
-		Addr:    listenAddr,
-		Handler: mux,
+		Addr:              listenAddr,
+		Handler:           mux,
+		ReadHeaderTimeout: 5 * time.Second,
+		WriteTimeout:      10 * time.Second,
+		IdleTimeout:       60 * time.Second,
 	}
 
 	slog.Info("starting server", "addr", listenAddr, "cache_ttl", ttl)
@@ -97,17 +105,22 @@ type sheetQuerier interface {
 }
 
 type cachedURLMap struct {
-	mu    sync.RWMutex
-	v     URLMap
+	mu         sync.RWMutex
+	v          URLMap
+	lastUpdate time.Time
+
+	// refreshing prevents concurrent on-request refresh kicks.
+	refreshing atomic.Bool
+
 	ttl   time.Duration
 	sheet sheetQuerier
 }
 
-// start does an initial synchronous load then refreshes on the TTL interval in
-// the background. Stale data is served if a refresh fails.
+// start launches background refresh in a goroutine so the server can bind
+// and accept health checks immediately. The cache populates asynchronously.
 func (c *cachedURLMap) start(ctx context.Context) {
-	c.doRefresh(ctx)
 	go func() {
+		c.doRefresh(ctx)
 		ticker := time.NewTicker(c.ttl)
 		defer ticker.Stop()
 		for {
@@ -130,10 +143,28 @@ func (c *cachedURLMap) doRefresh(ctx context.Context) {
 	m := urlMap(rows)
 	c.mu.Lock()
 	c.v = m
+	c.lastUpdate = time.Now()
 	c.mu.Unlock()
 }
 
+// kickRefresh fires a one-shot background refresh when the cache is stale and
+// no on-request refresh is already running. This keeps the cache warm when
+// Cloud Run's default CPU throttling prevents the background goroutine from
+// ticking between requests.
+func (c *cachedURLMap) kickRefresh() {
+	c.mu.RLock()
+	stale := !c.lastUpdate.IsZero() && time.Since(c.lastUpdate) > c.ttl
+	c.mu.RUnlock()
+	if stale && c.refreshing.CompareAndSwap(false, true) {
+		go func() {
+			defer c.refreshing.Store(false)
+			c.doRefresh(context.Background())
+		}()
+	}
+}
+
 func (c *cachedURLMap) Get(key string) *url.URL {
+	c.kickRefresh()
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 	return c.v[key]

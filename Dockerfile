@@ -10,4 +10,5 @@ FROM docker.io/alpine:latest
 RUN apk add --no-cache ca-certificates tzdata && \
   update-ca-certificates
 COPY --from=compiler /src/app/a.out /server
+USER nobody
 ENTRYPOINT ["/server"]

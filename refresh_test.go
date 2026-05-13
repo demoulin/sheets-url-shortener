@@ -39,10 +39,11 @@ func TestCachedURLMapRefresh(t *testing.T) {
 		ctx, cancel := context.WithCancel(context.Background())
 		defer cancel()
 
+		// start() is async; Wait() lets the initial refresh and first ticker
+		// select complete before we inspect state.
 		cache.start(ctx)
-		synctest.Wait() // background goroutine now blocked on ticker
+		synctest.Wait()
 
-		// initial synchronous refresh fires once
 		if n := mock.calls.Load(); n != 1 {
 			t.Errorf("after start: calls=%d, want 1", n)
 		}
@@ -66,6 +67,8 @@ func TestCachedURLMapRefresh(t *testing.T) {
 		if n := mock.calls.Load(); n != 3 {
 			t.Errorf("after error tick: calls=%d, want 3", n)
 		}
+		// lastUpdate was T1 (last success); at T2 time.Since(T1)=TTL which is
+		// not > TTL, so kickRefresh does not fire — safe to call Get here.
 		if cache.Get("gh") == nil {
 			t.Error("stale data should be served when refresh fails")
 		}
@@ -73,5 +76,39 @@ func TestCachedURLMapRefresh(t *testing.T) {
 		// canceling ctx must stop the background goroutine cleanly
 		cancel()
 		synctest.Wait()
+	})
+}
+
+func TestKickRefreshOnStaleCacheEntry(t *testing.T) {
+	synctest.Run(func() {
+		mock := &mockSheet{rows: [][]interface{}{{"gh", "https://github.com"}}}
+		cache := &cachedURLMap{ttl: time.Second, sheet: mock}
+
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+
+		cache.start(ctx)
+		synctest.Wait() // initial refresh done, calls=1
+
+		// Simulate CPU-throttled Cloud Run: stop the background goroutine
+		// by canceling its context, then verify a stale Get kicks a refresh.
+		cancel()
+		synctest.Wait() // background goroutine exited
+
+		// Advance past TTL without any background tick.
+		time.Sleep(2 * time.Second)
+
+		// A fresh context for any kick-triggered refresh goroutines.
+		ctx2, cancel2 := context.WithCancel(context.Background())
+		defer cancel2()
+		_ = ctx2
+
+		// Get sees the cache is stale (lastUpdate > TTL ago) and kicks a refresh.
+		cache.Get("gh")
+		synctest.Wait() // kick-triggered refresh goroutine completes
+
+		if n := mock.calls.Load(); n != 2 {
+			t.Errorf("after stale Get: calls=%d, want 2", n)
+		}
 	})
 }
