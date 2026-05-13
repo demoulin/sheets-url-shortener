@@ -5,6 +5,7 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"strings"
+	"sync"
 	"testing"
 )
 
@@ -57,8 +58,18 @@ func TestURLMap(t *testing.T) {
 			wantCount: 1,
 		},
 		{
-			name: "non-string values skipped",
-			rows: [][]interface{}{{42, "https://example.com"}},
+			name:      "non-string key skipped",
+			rows:      [][]interface{}{{42, "https://example.com"}},
+			wantCount: 0,
+		},
+		{
+			name:      "empty URL value skipped",
+			rows:      [][]interface{}{{"gh", ""}},
+			wantCount: 0,
+		},
+		{
+			name:      "non-string URL value skipped",
+			rows:      [][]interface{}{{"gh", 42}},
 			wantCount: 0,
 		},
 	}
@@ -173,7 +184,24 @@ func TestFindRedirect(t *testing.T) {
 		{"/gh/extra", "https://github.com/extra"},
 		{"/notfound", ""},
 		{"/gh/sub?foo=bar", "https://github.com/sub?foo=bar"},
+		{"/gh?q=1", "https://github.com?q=1"},           // exact match forwards query params
+		{"/gh/", "https://github.com"},                  // trailing slash collapses to base
 	}
+
+	t.Run("exact match beats prefix", func(t *testing.T) {
+		s := makeTestServer(map[string]string{
+			"gcp":      "https://cloud.google.com",
+			"gcp/docs": "https://docs.google.com",
+		})
+		req, _ := url.Parse("https://go.example.com/gcp/docs")
+		got := s.findRedirect(req)
+		if got == nil {
+			t.Fatal("expected a redirect, got nil")
+		}
+		if got.String() != "https://docs.google.com" {
+			t.Errorf("got %s, want https://docs.google.com", got.String())
+		}
+	})
 
 	for _, tt := range tests {
 		t.Run(tt.path, func(t *testing.T) {
@@ -257,4 +285,62 @@ func TestHandlers(t *testing.T) {
 			t.Errorf("status=%d, want %d", rec.Code, http.StatusOK)
 		}
 	})
+}
+
+func TestStaticHandlers(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /favicon.ico", faviconHandler)
+	mux.HandleFunc("GET /robots.txt", robotsHandler)
+
+	t.Run("favicon returns image/x-icon", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodGet, "/favicon.ico", nil)
+		rec := httptest.NewRecorder()
+		mux.ServeHTTP(rec, req)
+		if rec.Code != http.StatusOK {
+			t.Errorf("status=%d, want %d", rec.Code, http.StatusOK)
+		}
+		if ct := rec.Header().Get("Content-Type"); ct != "image/x-icon" {
+			t.Errorf("Content-Type=%q, want image/x-icon", ct)
+		}
+		if rec.Body.Len() == 0 {
+			t.Error("favicon body is empty")
+		}
+	})
+
+	t.Run("robots.txt disallows all", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodGet, "/robots.txt", nil)
+		rec := httptest.NewRecorder()
+		mux.ServeHTTP(rec, req)
+		if rec.Code != http.StatusOK {
+			t.Errorf("status=%d, want %d", rec.Code, http.StatusOK)
+		}
+		if ct := rec.Header().Get("Content-Type"); ct != "text/plain" {
+			t.Errorf("Content-Type=%q, want text/plain", ct)
+		}
+		body := rec.Body.String()
+		if !strings.Contains(body, "Disallow: /") {
+			t.Errorf("robots.txt body missing Disallow: got %q", body)
+		}
+	})
+}
+
+func TestCachedURLMapConcurrentReads(t *testing.T) {
+	m := make(URLMap)
+	u, _ := url.Parse("https://github.com")
+	m["gh"] = u
+	cache := &cachedURLMap{v: m}
+
+	const goroutines = 50
+	var wg sync.WaitGroup
+	wg.Add(goroutines)
+	for range goroutines {
+		go func() {
+			defer wg.Done()
+			got := cache.Get("gh")
+			if got == nil {
+				t.Errorf("expected URL, got nil")
+			}
+		}()
+	}
+	wg.Wait()
 }
