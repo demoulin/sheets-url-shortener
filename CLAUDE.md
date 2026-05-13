@@ -15,13 +15,7 @@ GOOGLE_SHEET_ID=<id> go run .
 # Build binary
 CGO_ENABLED=0 go build -o ./a.out .
 
-# Run tests (no external dependencies required)
-go test ./...
-
-# Run tests with race detector
-go test -race ./...
-
-# Run tests on Go <1.26 (testing/synctest not yet stable)
+# Run tests (testing/synctest requires the experiment flag)
 GOEXPERIMENT=synctest go test -race ./...
 
 # Build Docker image
