@@ -1,0 +1,260 @@
+package main
+
+import (
+	"net/http"
+	"net/http/httptest"
+	"net/url"
+	"strings"
+	"testing"
+)
+
+func TestURLMap(t *testing.T) {
+	tests := []struct {
+		name      string
+		rows      [][]interface{}
+		wantKeys  map[string]string // shortcut → expected URL string
+		wantCount int
+	}{
+		{
+			name:      "empty input",
+			rows:      nil,
+			wantCount: 0,
+		},
+		{
+			name:      "valid row",
+			rows:      [][]interface{}{{"gh", "https://github.com"}},
+			wantKeys:  map[string]string{"gh": "https://github.com"},
+			wantCount: 1,
+		},
+		{
+			name:      "key normalized to lowercase",
+			rows:      [][]interface{}{{"GH", "https://github.com"}},
+			wantKeys:  map[string]string{"gh": "https://github.com"},
+			wantCount: 1,
+		},
+		{
+			name:      "row with fewer than 2 columns skipped",
+			rows:      [][]interface{}{{"gh"}},
+			wantCount: 0,
+		},
+		{
+			name:      "empty key skipped",
+			rows:      [][]interface{}{{"", "https://example.com"}},
+			wantCount: 0,
+		},
+		{
+			name:      "invalid URL skipped",
+			rows:      [][]interface{}{{"bad", "://missing-scheme"}},
+			wantCount: 0,
+		},
+		{
+			name: "duplicate key last wins",
+			rows: [][]interface{}{
+				{"gh", "https://github.com"},
+				{"gh", "https://gitlab.com"},
+			},
+			wantKeys:  map[string]string{"gh": "https://gitlab.com"},
+			wantCount: 1,
+		},
+		{
+			name: "non-string values skipped",
+			rows: [][]interface{}{{42, "https://example.com"}},
+			wantCount: 0,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			m := urlMap(tt.rows)
+			if len(m) != tt.wantCount {
+				t.Errorf("len=%d, want %d", len(m), tt.wantCount)
+			}
+			for k, wantURL := range tt.wantKeys {
+				got, ok := m[k]
+				if !ok {
+					t.Errorf("missing key %q", k)
+					continue
+				}
+				if got.String() != wantURL {
+					t.Errorf("key %q: got %q, want %q", k, got.String(), wantURL)
+				}
+			}
+		})
+	}
+}
+
+func TestPrepRedirect(t *testing.T) {
+	t.Run("clones base — original must not be mutated", func(t *testing.T) {
+		base, _ := url.Parse("https://example.com/base?existing=1")
+		origPath := base.Path
+		origQuery := base.RawQuery
+
+		_ = prepRedirect(base, "extra", url.Values{"added": {"2"}})
+
+		if base.Path != origPath {
+			t.Errorf("base.Path mutated: got %q, want %q", base.Path, origPath)
+		}
+		if base.RawQuery != origQuery {
+			t.Errorf("base.RawQuery mutated: got %q, want %q", base.RawQuery, origQuery)
+		}
+	})
+
+	t.Run("appends path segment", func(t *testing.T) {
+		base, _ := url.Parse("https://example.com/root")
+		out := prepRedirect(base, "sub/path", nil)
+		if !strings.HasSuffix(out.Path, "/root/sub/path") {
+			t.Errorf("unexpected path: %s", out.Path)
+		}
+	})
+
+	t.Run("path already ending in slash", func(t *testing.T) {
+		base, _ := url.Parse("https://example.com/root/")
+		out := prepRedirect(base, "leaf", nil)
+		if strings.Contains(out.Path, "//") {
+			t.Errorf("double slash in path: %s", out.Path)
+		}
+	})
+
+	t.Run("merges query params preserving existing", func(t *testing.T) {
+		base, _ := url.Parse("https://example.com/?kept=yes")
+		out := prepRedirect(base, "", url.Values{"added": {"val"}})
+		q := out.Query()
+		if q.Get("kept") != "yes" {
+			t.Error("lost existing query param 'kept'")
+		}
+		if q.Get("added") != "val" {
+			t.Error("missing forwarded query param 'added'")
+		}
+	})
+
+	t.Run("multi-value query params forwarded", func(t *testing.T) {
+		base, _ := url.Parse("https://example.com/")
+		out := prepRedirect(base, "", url.Values{"tag": {"a", "b"}})
+		q := out.Query()
+		if got := q["tag"]; len(got) != 2 {
+			t.Errorf("tag values: got %v, want [a b]", got)
+		}
+	})
+
+	t.Run("no addPath and no query leaves URL unchanged", func(t *testing.T) {
+		base, _ := url.Parse("https://example.com/path")
+		out := prepRedirect(base, "", nil)
+		if out.String() != base.String() {
+			t.Errorf("got %s, want %s", out.String(), base.String())
+		}
+	})
+}
+
+// makeTestServer builds a server with a pre-populated in-memory URL map.
+func makeTestServer(shortcuts map[string]string) *server {
+	m := make(URLMap)
+	for k, v := range shortcuts {
+		u, _ := url.Parse(v)
+		m[strings.ToLower(k)] = u
+	}
+	return &server{db: &cachedURLMap{v: m}}
+}
+
+func TestFindRedirect(t *testing.T) {
+	srv := makeTestServer(map[string]string{
+		"gh":  "https://github.com",
+		"gcp": "https://cloud.google.com",
+	})
+
+	tests := []struct {
+		path    string
+		wantURL string // empty = expect nil
+	}{
+		{"/gh", "https://github.com"},
+		{"/GH", "https://github.com"},            // case-insensitive
+		{"/gcp", "https://cloud.google.com"},
+		{"/gcp/docs", "https://cloud.google.com/docs"},
+		{"/gcp/a/b/c", "https://cloud.google.com/a/b/c"},
+		{"/gh/extra", "https://github.com/extra"},
+		{"/notfound", ""},
+		{"/gh/sub?foo=bar", "https://github.com/sub?foo=bar"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.path, func(t *testing.T) {
+			req, _ := url.Parse("https://go.example.com" + tt.path)
+			got := srv.findRedirect(req)
+			if tt.wantURL == "" {
+				if got != nil {
+					t.Errorf("expected nil, got %s", got)
+				}
+				return
+			}
+			if got == nil {
+				t.Fatalf("expected %s, got nil", tt.wantURL)
+			}
+			if got.String() != tt.wantURL {
+				t.Errorf("got %s, want %s", got.String(), tt.wantURL)
+			}
+		})
+	}
+}
+
+func TestHandlers(t *testing.T) {
+	srv := makeTestServer(map[string]string{
+		"gh": "https://github.com",
+	})
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /healthz", healthHandler)
+	mux.HandleFunc("/", srv.handler)
+
+	t.Run("known shortcut redirects with 302", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodGet, "/gh", nil)
+		rec := httptest.NewRecorder()
+		mux.ServeHTTP(rec, req)
+		if rec.Code != http.StatusFound {
+			t.Errorf("status=%d, want %d", rec.Code, http.StatusFound)
+		}
+		if loc := rec.Header().Get("Location"); loc != "https://github.com" {
+			t.Errorf("Location=%q, want %q", loc, "https://github.com")
+		}
+	})
+
+	t.Run("unknown shortcut returns 404", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodGet, "/missing", nil)
+		rec := httptest.NewRecorder()
+		mux.ServeHTTP(rec, req)
+		if rec.Code != http.StatusNotFound {
+			t.Errorf("status=%d, want %d", rec.Code, http.StatusNotFound)
+		}
+	})
+
+	t.Run("home without HOME_REDIRECT returns 404", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodGet, "/", nil)
+		rec := httptest.NewRecorder()
+		mux.ServeHTTP(rec, req)
+		if rec.Code != http.StatusNotFound {
+			t.Errorf("status=%d, want %d", rec.Code, http.StatusNotFound)
+		}
+	})
+
+	t.Run("home with HOME_REDIRECT redirects", func(t *testing.T) {
+		s := makeTestServer(nil)
+		s.homeRedirect = "https://example.com"
+		mux2 := http.NewServeMux()
+		mux2.HandleFunc("/", s.handler)
+		req := httptest.NewRequest(http.MethodGet, "/", nil)
+		rec := httptest.NewRecorder()
+		mux2.ServeHTTP(rec, req)
+		if rec.Code != http.StatusFound {
+			t.Errorf("status=%d, want %d", rec.Code, http.StatusFound)
+		}
+		if loc := rec.Header().Get("Location"); loc != "https://example.com" {
+			t.Errorf("Location=%q, want %q", loc, "https://example.com")
+		}
+	})
+
+	t.Run("healthz returns 200", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodGet, "/healthz", nil)
+		rec := httptest.NewRecorder()
+		mux.ServeHTTP(rec, req)
+		if rec.Code != http.StatusOK {
+			t.Errorf("status=%d, want %d", rec.Code, http.StatusOK)
+		}
+	})
+}

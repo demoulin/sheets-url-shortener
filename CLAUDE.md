@@ -15,6 +15,12 @@ GOOGLE_SHEET_ID=<id> go run .
 # Build binary
 CGO_ENABLED=0 go build -o ./a.out .
 
+# Run tests (no external dependencies required)
+go test ./...
+
+# Run tests with race detector
+go test -race ./...
+
 # Build Docker image
 docker build -t sheets-url-shortener .
 
@@ -23,7 +29,7 @@ go get -u google.golang.org/api
 go mod tidy
 ```
 
-There are no tests and no linter configuration in this project.
+There is no linter configuration in this project.
 
 ## Architecture
 
