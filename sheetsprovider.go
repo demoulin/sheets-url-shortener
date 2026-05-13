@@ -3,7 +3,7 @@ package main
 import (
 	"context"
 	"fmt"
-	"log"
+	"log/slog"
 
 	"google.golang.org/api/sheets/v4"
 )
@@ -23,15 +23,15 @@ func (s *sheetsProvider) Query(ctx context.Context) ([][]interface{}, error) {
 		return nil, fmt.Errorf("unable to retrieve Sheets client: %w", err)
 	}
 
-	log.Println("querying sheet")
 	readRange := "A:B"
 	if s.sheetName != "" {
 		readRange = s.sheetName + "!" + readRange
 	}
+	slog.Info("querying sheet", "id", s.googleSheetsID, "range", readRange)
 	resp, err := srv.Spreadsheets.Values.Get(s.googleSheetsID, readRange).Do()
 	if err != nil {
 		return nil, fmt.Errorf("unable to retrieve data from sheet: %w", err)
 	}
-	log.Printf("queried %d rows", len(resp.Values))
+	slog.Info("sheet queried", "rows", len(resp.Values))
 	return resp.Values, nil
 }

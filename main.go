@@ -3,15 +3,19 @@ package main
 import (
 	"context"
 	"embed"
+	"errors"
 	"fmt"
-	"io"
-	"log"
+	"log/slog"
 	"net"
 	"net/http"
 	"net/url"
 	"os"
+	"os/signal"
+	"runtime/debug"
 	"strings"
 	"sync"
+	"sync/atomic"
+	"syscall"
 	"time"
 )
 
@@ -19,44 +23,77 @@ import (
 var static embed.FS
 
 func main() {
-	port, addr := os.Getenv("PORT"), os.Getenv("LISTEN_ADDR")
+	// JSON logs so Cloud Logging can parse structured fields.
+	slog.SetDefault(slog.New(slog.NewJSONHandler(os.Stdout, nil)))
+
+	port := os.Getenv("PORT")
 	if port == "" {
 		port = "8080"
 	}
+	addr := os.Getenv("LISTEN_ADDR")
 
 	googleSheetsID := os.Getenv("GOOGLE_SHEET_ID")
 	sheetName := os.Getenv("SHEET_NAME")
 	homeRedirect := os.Getenv("HOME_REDIRECT")
+	projectID := os.Getenv("GOOGLE_CLOUD_PROJECT")
 
-	ttlVal := os.Getenv("CACHE_TTL")
-	ttl := time.Second * 5
-	if ttlVal != "" {
+	ttl := 5 * time.Second
+	if ttlVal := os.Getenv("CACHE_TTL"); ttlVal != "" {
 		v, err := time.ParseDuration(ttlVal)
 		if err != nil {
-			log.Fatalf("failed to parse CACHE_TTL as duration: %w", err)
+			slog.Error("invalid CACHE_TTL", "value", ttlVal, "err", err)
+			os.Exit(1)
 		}
 		ttl = v
 	}
 
-	srv := &server{
-		db: &cachedURLMap{
-			ttl: ttl,
-			sheet: &sheetsProvider{
-				googleSheetsID: googleSheetsID,
-				sheetName:      sheetName,
-			},
+	cache := &cachedURLMap{
+		ttl: ttl,
+		sheet: &sheetsProvider{
+			googleSheetsID: googleSheetsID,
+			sheetName:      sheetName,
 		},
-		homeRedirect: homeRedirect,
 	}
 
-	http.HandleFunc("/favicon.ico", faviconHandler)
-	http.HandleFunc("/robots.txt", robotsHandler)
-	http.HandleFunc("/", srv.handler)
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
+	defer stop()
+
+	// Start async — server is ready to accept requests immediately.
+	cache.start(ctx)
+
+	srv := &server{db: cache, homeRedirect: homeRedirect}
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /favicon.ico", faviconHandler)
+	mux.HandleFunc("GET /robots.txt", robotsHandler)
+	mux.HandleFunc("GET /healthz", healthHandler)
+	mux.HandleFunc("/", srv.handler)
 
 	listenAddr := net.JoinHostPort(addr, port)
-	log.Printf("starting server at %s; ttl=%v", listenAddr, ttl)
-	err := http.ListenAndServe(listenAddr, nil)
-	log.Fatal(err)
+	httpSrv := &http.Server{
+		Addr:              listenAddr,
+		Handler:           requestLogger(projectID)(recovery(securityHeaders(mux))),
+		ErrorLog:          slog.NewLogLogger(slog.Default().Handler(), slog.LevelError),
+		ReadHeaderTimeout: 5 * time.Second,
+		WriteTimeout:      10 * time.Second,
+		IdleTimeout:       60 * time.Second,
+	}
+
+	slog.Info("starting server", "addr", listenAddr, "cache_ttl", ttl)
+
+	go func() {
+		<-ctx.Done()
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		if err := httpSrv.Shutdown(shutdownCtx); err != nil {
+			slog.Error("graceful shutdown failed", "err", err)
+		}
+	}()
+
+	if err := httpSrv.ListenAndServe(); !errors.Is(err, http.ErrServerClosed) {
+		slog.Error("server failed", "err", err)
+		os.Exit(1)
+	}
 }
 
 type server struct {
@@ -66,122 +103,152 @@ type server struct {
 
 type URLMap map[string]*url.URL
 
+type sheetQuerier interface {
+	Query(ctx context.Context) ([][]interface{}, error)
+}
+
 type cachedURLMap struct {
-	sync.RWMutex
+	mu         sync.RWMutex
 	v          URLMap
 	lastUpdate time.Time
 
+	// refreshing prevents concurrent on-request refresh kicks.
+	refreshing atomic.Bool
+
 	ttl   time.Duration
-	sheet *sheetsProvider
+	sheet sheetQuerier
 }
 
-func (c *cachedURLMap) Get(query string) (*url.URL, error) {
-	if err := c.refresh(); err != nil {
-		return nil, fmt.Errorf("failed to refresh cache: %w", err)
-	}
-	c.RLock()
-	defer c.RUnlock()
-	return c.v[query], nil
+// start launches background refresh in a goroutine so the server can bind
+// and accept health checks immediately. The cache populates asynchronously.
+func (c *cachedURLMap) start(ctx context.Context) {
+	go func() {
+		c.doRefresh(ctx)
+		ticker := time.NewTicker(c.ttl)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				c.doRefresh(ctx)
+			}
+		}
+	}()
 }
 
-func (c *cachedURLMap) refresh() error {
-	c.Lock()
-	defer c.Unlock()
-	if time.Since(c.lastUpdate) <= c.ttl {
-		return nil
-	}
-
-	rows, err := c.sheet.Query(context.Background())
+func (c *cachedURLMap) doRefresh(ctx context.Context) {
+	rows, err := c.sheet.Query(ctx)
 	if err != nil {
-		return fmt.Errorf("failed to query sheet: %w", err)
+		slog.Error("failed to refresh URL cache", "err", err)
+		return // keep serving stale data
 	}
-	c.v = urlMap(rows)
+	m := urlMap(rows)
+	c.mu.Lock()
+	c.v = m
 	c.lastUpdate = time.Now()
+	c.mu.Unlock()
+}
+
+// kickRefresh fires a one-shot background refresh when the cache is stale and
+// no on-request refresh is already running. This keeps the cache warm when
+// Cloud Run's default CPU throttling prevents the background goroutine from
+// ticking between requests.
+func (c *cachedURLMap) kickRefresh() {
+	c.mu.RLock()
+	stale := !c.lastUpdate.IsZero() && time.Since(c.lastUpdate) > c.ttl
+	c.mu.RUnlock()
+	if stale && c.refreshing.CompareAndSwap(false, true) {
+		go func() {
+			defer c.refreshing.Store(false)
+			c.doRefresh(context.Background())
+		}()
+	}
+}
+
+func (c *cachedURLMap) Get(key string) *url.URL {
+	c.kickRefresh()
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.v[key]
+}
+
+func (s *server) handler(w http.ResponseWriter, r *http.Request) {
+	if r.URL.Path == "/" {
+		s.home(w, r)
+		return
+	}
+	s.redirect(w, r)
+}
+
+func (s *server) home(w http.ResponseWriter, r *http.Request) {
+	if s.homeRedirect != "" {
+		http.Redirect(w, r, s.homeRedirect, http.StatusFound)
+		return
+	}
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.Header().Set("Content-Security-Policy", "default-src 'none'")
+	w.Header().Set("X-Frame-Options", "DENY")
+	w.WriteHeader(http.StatusNotFound)
+	fmt.Fprint(w, `<!DOCTYPE html>
+<html><head><title>Not found</title></head><body>
+<h1>Not found :(</h1>
+<p>This URL redirector requires a shortcut in the path.</p>
+</body></html>`)
+}
+
+func (s *server) redirect(w http.ResponseWriter, r *http.Request) {
+	redirTo := s.findRedirect(r.URL)
+	if redirTo == nil {
+		http.NotFound(w, r)
+		return
+	}
+	http.Redirect(w, r, redirTo.String(), http.StatusFound)
+}
+
+// findRedirect does longest-prefix path matching. For /a/b/c it tries
+// "a/b/c" → "a/b" → "a", stopping at the first match. Any unmatched tail
+// segments are appended to the destination URL. Lookup is case-insensitive.
+func (s *server) findRedirect(req *url.URL) *url.URL {
+	path := strings.TrimPrefix(req.Path, "/")
+	segments := strings.Split(path, "/")
+	var tail []string
+	for len(segments) > 0 {
+		key := strings.ToLower(strings.Join(segments, "/"))
+		if v := s.db.Get(key); v != nil {
+			return prepRedirect(v, strings.Join(tail, "/"), req.Query())
+		}
+		tail = append([]string{segments[len(segments)-1]}, tail...)
+		segments = segments[:len(segments)-1]
+	}
 	return nil
 }
 
-func (s *server) handler(w http.ResponseWriter, req *http.Request) {
-	if req.URL.Path == "/" {
-		s.home(w, req)
-		return
-	}
-	s.redirect(w, req)
-}
-
-func (s *server) home(w http.ResponseWriter, req *http.Request) {
-	if s.homeRedirect != "" {
-		http.Redirect(w, req, s.homeRedirect, http.StatusFound)
-		return
-	}
-
-	w.WriteHeader(http.StatusNotFound)
-	_, _ = fmt.Fprintf(w, `<!DOCTYPE html>
-	<html><head><title>Not found</title></head><body><h1>Not found :(</h1>
-	<p>This is home page for a URL redirector service.</p>
-	<p>The URL is missing the shortcut in the path.</p>
-	</body></html>`)
-}
-
-func (s *server) redirect(w http.ResponseWriter, req *http.Request) {
-
-	if req.Body != nil {
-		defer func(Body io.ReadCloser) {
-			_ = Body.Close()
-		}(req.Body)
-	}
-	redirTo, err := s.findRedirect(req.URL)
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, "failed to find redirect: %w", err)
-		return
-	}
-	if redirTo == nil {
-		w.WriteHeader(http.StatusNotFound)
-		_, _ = fmt.Fprintf(w, "404 not found")
-		return
-	}
-
-	log.Printf("redirecting=%q to=%q", req.URL, redirTo.String())
-	http.Redirect(w, req, redirTo.String(), http.StatusFound) // no permanent redirects
-}
-
-func (s *server) findRedirect(req *url.URL) (*url.URL, error) {
-	path := strings.TrimPrefix(req.Path, "/")
-
-	segments := strings.Split(path, "/")
-	var discard []string
-	for len(segments) > 0 {
-		query := strings.Join(segments, "/")
-		v, err := s.db.Get(query)
-		if err != nil {
-			return nil, fmt.Errorf("failed to get URL from cache for query %q: %w", query, err)
-		}
-		if v != nil {
-			return prepRedirect(v, strings.Join(discard, "/"), req.Query()), nil
-		}
-		discard = append([]string{segments[len(segments)-1]}, discard...)
-		segments = segments[:len(segments)-1]
-	}
-	return nil, nil
-}
-
+// prepRedirect clones base and merges addPath and query into the clone.
 func prepRedirect(base *url.URL, addPath string, query url.Values) *url.URL {
+	out := *base // clone — never mutate the shared map entry
 	if addPath != "" {
-		if !strings.HasSuffix(base.Path, "/") {
-			base.Path += "/"
+		if !strings.HasSuffix(out.Path, "/") {
+			out.Path += "/"
 		}
-		base.Path += addPath
+		out.Path += addPath
 	}
-
-	qs := base.Query()
-	for k := range query {
-		qs.Add(k, query.Get(k))
+	if len(query) > 0 {
+		qs := out.Query()
+		for k, vs := range query {
+			for _, v := range vs {
+				qs.Add(k, v)
+			}
+		}
+		out.RawQuery = qs.Encode()
 	}
-	base.RawQuery = qs.Encode()
-	return base
+	return &out
 }
 
+// urlMap parses sheet rows into a URLMap. Col A is the shortcut (lowercased),
+// col B is the destination URL. Duplicate shortcuts log a warning; last wins.
 func urlMap(in [][]interface{}) URLMap {
-	out := make(URLMap)
+	out := make(URLMap, len(in))
 	for _, row := range in {
 		if len(row) < 2 {
 			continue
@@ -194,43 +261,130 @@ func urlMap(in [][]interface{}) URLMap {
 		if !ok || v == "" {
 			continue
 		}
-
 		k = strings.ToLower(k)
 		u, err := url.Parse(v)
 		if err != nil {
-			log.Printf("warn: %s=%s url invalid", k, v)
+			slog.Warn("skipping invalid URL in sheet", "shortcut", k, "url", v, "err", err)
 			continue
 		}
-
-		_, exists := out[k]
-		if exists {
-			log.Printf("warn: shortcut %q redeclared, overwriting", k)
+		if u.Scheme != "http" && u.Scheme != "https" {
+			slog.Warn("skipping URL with non-http(s) scheme in sheet", "shortcut", k, "scheme", u.Scheme)
+			continue
+		}
+		if _, dup := out[k]; dup {
+			slog.Warn("duplicate shortcut in sheet, overwriting", "shortcut", k)
 		}
 		out[k] = u
 	}
 	return out
 }
 
-func writeError(w http.ResponseWriter, code int, msg string, vals ...interface{}) {
-	w.WriteHeader(code)
-	_, _ = fmt.Fprintf(w, msg, vals...)
+// statusWriter wraps ResponseWriter to capture the status code written by a handler.
+type statusWriter struct {
+	http.ResponseWriter
+	status int
 }
 
-func faviconHandler(w http.ResponseWriter, req *http.Request) {
-	w.Header().Set("Content-Type", "image/x-icon")
-	w.Header().Set("Cache-Control", "public, max-age=7776000")
-	favicon, err := static.ReadFile("static/favicon.ico")
-	if err != nil {
-		log.Printf("failed to read favicon.ico: %v", err) // Optional: log the error
-		http.Error(w, "favicon not found", http.StatusNotFound)
+func (w *statusWriter) WriteHeader(code int) {
+	w.status = code
+	w.ResponseWriter.WriteHeader(code)
+}
+
+// parseCloudTrace parses an X-Cloud-Trace-Context header value.
+// Format: TRACE_ID[/SPAN_ID[;o=FLAGS]]
+func parseCloudTrace(h string) (traceID, spanID string) {
+	if h == "" {
 		return
 	}
-	_, _ = w.Write(favicon) // Send the favicon
+	traceID, rest, _ := strings.Cut(h, "/")
+	spanID, _, _ = strings.Cut(rest, ";")
+	return
 }
 
-func robotsHandler(w http.ResponseWriter, req *http.Request) {
+// requestLogger logs one structured access-log entry per request and attaches
+// Cloud Trace fields so Cloud Logging can correlate log entries with traces.
+func requestLogger(projectID string) func(http.Handler) http.Handler {
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			start := time.Now()
+			ww := &statusWriter{ResponseWriter: w, status: http.StatusOK}
+
+			logger := slog.Default()
+			traceID, spanID := parseCloudTrace(r.Header.Get("X-Cloud-Trace-Context"))
+			if traceID != "" {
+				trace := traceID
+				if projectID != "" {
+					trace = "projects/" + projectID + "/traces/" + traceID
+				}
+				logger = logger.With(
+					"logging.googleapis.com/trace", trace,
+					"logging.googleapis.com/spanId", spanID,
+				)
+			}
+
+			next.ServeHTTP(ww, r)
+
+			attrs := []any{
+				"method", r.Method,
+				"path", r.URL.Path,
+				"status", ww.status,
+				"latency_ms", time.Since(start).Milliseconds(),
+			}
+			if loc := ww.Header().Get("Location"); loc != "" {
+				attrs = append(attrs, "location", loc)
+			}
+			logger.Info("request", attrs...)
+		})
+	}
+}
+
+// securityHeaders adds baseline security headers to every response.
+// CSP and X-Frame-Options are added per-handler for HTML responses.
+func securityHeaders(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("X-Content-Type-Options", "nosniff")
+		w.Header().Set("Referrer-Policy", "no-referrer")
+		next.ServeHTTP(w, r)
+	})
+}
+
+// recovery wraps a handler with panic recovery. The panic value and full stack
+// trace are written as a single JSON log entry so Cloud Error Reporting can
+// group them correctly. net/http's built-in recovery is bypassed this way.
+func recovery(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		defer func() {
+			if p := recover(); p != nil {
+				slog.Error("panic recovered",
+					"panic", fmt.Sprintf("%v", p),
+					"stack", string(debug.Stack()),
+					"method", r.Method,
+					"path", r.URL.Path,
+				)
+				http.Error(w, "internal server error", http.StatusInternalServerError)
+			}
+		}()
+		next.ServeHTTP(w, r)
+	})
+}
+
+func faviconHandler(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "image/x-icon")
+	w.Header().Set("Cache-Control", "public, max-age=7776000")
+	data, err := static.ReadFile("static/favicon.ico")
+	if err != nil {
+		http.Error(w, "not found", http.StatusNotFound)
+		return
+	}
+	_, _ = w.Write(data)
+}
+
+func robotsHandler(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/plain")
 	w.Header().Set("Cache-Control", "public, max-age=7776000")
-	robots := "User-agent: *\nDisallow: /"
-	_, _ = w.Write([]byte(robots)) // Send the robots.txt
+	_, _ = w.Write([]byte("User-agent: *\nDisallow: /"))
+}
+
+func healthHandler(w http.ResponseWriter, r *http.Request) {
+	w.WriteHeader(http.StatusOK)
 }
