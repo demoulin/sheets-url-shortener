@@ -35,6 +35,7 @@ func main() {
 	googleSheetsID := os.Getenv("GOOGLE_SHEET_ID")
 	sheetName := os.Getenv("SHEET_NAME")
 	homeRedirect := os.Getenv("HOME_REDIRECT")
+	projectID := os.Getenv("GOOGLE_CLOUD_PROJECT")
 
 	ttl := 5 * time.Second
 	if ttlVal := os.Getenv("CACHE_TTL"); ttlVal != "" {
@@ -71,7 +72,7 @@ func main() {
 	listenAddr := net.JoinHostPort(addr, port)
 	httpSrv := &http.Server{
 		Addr:              listenAddr,
-		Handler:           recovery(securityHeaders(mux)),
+		Handler:           requestLogger(projectID)(recovery(securityHeaders(mux))),
 		ErrorLog:          slog.NewLogLogger(slog.Default().Handler(), slog.LevelError),
 		ReadHeaderTimeout: 5 * time.Second,
 		WriteTimeout:      10 * time.Second,
@@ -202,7 +203,6 @@ func (s *server) redirect(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 		return
 	}
-	slog.Info("redirecting", "from", r.URL.String(), "to", redirTo.String())
 	http.Redirect(w, r, redirTo.String(), http.StatusFound)
 }
 
@@ -277,6 +277,65 @@ func urlMap(in [][]interface{}) URLMap {
 		out[k] = u
 	}
 	return out
+}
+
+// statusWriter wraps ResponseWriter to capture the status code written by a handler.
+type statusWriter struct {
+	http.ResponseWriter
+	status int
+}
+
+func (w *statusWriter) WriteHeader(code int) {
+	w.status = code
+	w.ResponseWriter.WriteHeader(code)
+}
+
+// parseCloudTrace parses an X-Cloud-Trace-Context header value.
+// Format: TRACE_ID[/SPAN_ID[;o=FLAGS]]
+func parseCloudTrace(h string) (traceID, spanID string) {
+	if h == "" {
+		return
+	}
+	traceID, rest, _ := strings.Cut(h, "/")
+	spanID, _, _ = strings.Cut(rest, ";")
+	return
+}
+
+// requestLogger logs one structured access-log entry per request and attaches
+// Cloud Trace fields so Cloud Logging can correlate log entries with traces.
+func requestLogger(projectID string) func(http.Handler) http.Handler {
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			start := time.Now()
+			ww := &statusWriter{ResponseWriter: w, status: http.StatusOK}
+
+			logger := slog.Default()
+			traceID, spanID := parseCloudTrace(r.Header.Get("X-Cloud-Trace-Context"))
+			if traceID != "" {
+				trace := traceID
+				if projectID != "" {
+					trace = "projects/" + projectID + "/traces/" + traceID
+				}
+				logger = logger.With(
+					"logging.googleapis.com/trace", trace,
+					"logging.googleapis.com/spanId", spanID,
+				)
+			}
+
+			next.ServeHTTP(ww, r)
+
+			attrs := []any{
+				"method", r.Method,
+				"path", r.URL.Path,
+				"status", ww.status,
+				"latency_ms", time.Since(start).Milliseconds(),
+			}
+			if loc := ww.Header().Get("Location"); loc != "" {
+				attrs = append(attrs, "location", loc)
+			}
+			logger.Info("request", attrs...)
+		})
+	}
 }
 
 // securityHeaders adds baseline security headers to every response.

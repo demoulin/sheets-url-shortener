@@ -347,6 +347,94 @@ func TestSecurityHeaders(t *testing.T) {
 	})
 }
 
+func TestParseCloudTrace(t *testing.T) {
+	tests := []struct {
+		header  string
+		traceID string
+		spanID  string
+	}{
+		{"", "", ""},
+		{"abc123", "abc123", ""},
+		{"abc123/456def", "abc123", "456def"},
+		{"abc123/456def;o=1", "abc123", "456def"},
+		{"abc123/456def;o=0", "abc123", "456def"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.header, func(t *testing.T) {
+			traceID, spanID := parseCloudTrace(tt.header)
+			if traceID != tt.traceID {
+				t.Errorf("traceID=%q, want %q", traceID, tt.traceID)
+			}
+			if spanID != tt.spanID {
+				t.Errorf("spanID=%q, want %q", spanID, tt.spanID)
+			}
+		})
+	}
+}
+
+func TestStatusWriter(t *testing.T) {
+	t.Run("defaults to 200 when WriteHeader not called", func(t *testing.T) {
+		rec := httptest.NewRecorder()
+		ww := &statusWriter{ResponseWriter: rec, status: http.StatusOK}
+		_, _ = ww.Write([]byte("body"))
+		if ww.status != http.StatusOK {
+			t.Errorf("status=%d, want 200", ww.status)
+		}
+	})
+
+	t.Run("captures explicit status code", func(t *testing.T) {
+		rec := httptest.NewRecorder()
+		ww := &statusWriter{ResponseWriter: rec, status: http.StatusOK}
+		ww.WriteHeader(http.StatusNotFound)
+		if ww.status != http.StatusNotFound {
+			t.Errorf("status=%d, want 404", ww.status)
+		}
+	})
+}
+
+func TestRequestLogger(t *testing.T) {
+	srv := makeTestServer(map[string]string{"gh": "https://github.com"})
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /healthz", healthHandler)
+	mux.HandleFunc("/", srv.handler)
+	h := requestLogger("")(recovery(securityHeaders(mux)))
+
+	t.Run("redirect response has Location in header", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodGet, "/gh", nil)
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+		if rec.Code != http.StatusFound {
+			t.Errorf("status=%d, want %d", rec.Code, http.StatusFound)
+		}
+		if loc := rec.Header().Get("Location"); loc != "https://github.com" {
+			t.Errorf("Location=%q, want https://github.com", loc)
+		}
+	})
+
+	t.Run("trace header is accepted without panic", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodGet, "/gh", nil)
+		req.Header.Set("X-Cloud-Trace-Context", "abc123/456def;o=1")
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req) // must not panic
+		if rec.Code != http.StatusFound {
+			t.Errorf("status=%d, want %d", rec.Code, http.StatusFound)
+		}
+	})
+
+	t.Run("projectID forms full trace path", func(t *testing.T) {
+		// Verify the middleware can be constructed with a project ID.
+		// Actual log output verification would require a custom slog handler.
+		h2 := requestLogger("my-project")(recovery(securityHeaders(mux)))
+		req := httptest.NewRequest(http.MethodGet, "/gh", nil)
+		req.Header.Set("X-Cloud-Trace-Context", "traceid123/spanid456;o=1")
+		rec := httptest.NewRecorder()
+		h2.ServeHTTP(rec, req)
+		if rec.Code != http.StatusFound {
+			t.Errorf("status=%d, want %d", rec.Code, http.StatusFound)
+		}
+	})
+}
+
 func TestStaticHandlers(t *testing.T) {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /favicon.ico", faviconHandler)
