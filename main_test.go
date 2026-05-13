@@ -49,6 +49,21 @@ func TestURLMap(t *testing.T) {
 			wantCount: 0,
 		},
 		{
+			name:      "javascript scheme rejected",
+			rows:      [][]interface{}{{"xss", "javascript:alert(1)"}},
+			wantCount: 0,
+		},
+		{
+			name:      "relative URL rejected (no scheme)",
+			rows:      [][]interface{}{{"rel", "/internal/path"}},
+			wantCount: 0,
+		},
+		{
+			name:      "ftp scheme rejected",
+			rows:      [][]interface{}{{"ftp", "ftp://files.example.com"}},
+			wantCount: 0,
+		},
+		{
 			name: "duplicate key last wins",
 			rows: [][]interface{}{
 				{"gh", "https://github.com"},
@@ -283,6 +298,51 @@ func TestHandlers(t *testing.T) {
 		mux.ServeHTTP(rec, req)
 		if rec.Code != http.StatusOK {
 			t.Errorf("status=%d, want %d", rec.Code, http.StatusOK)
+		}
+	})
+}
+
+func TestSecurityHeaders(t *testing.T) {
+	srv := makeTestServer(map[string]string{"gh": "https://github.com"})
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /healthz", healthHandler)
+	mux.HandleFunc("/", srv.handler)
+	h := recovery(securityHeaders(mux))
+
+	baselines := []struct {
+		path string
+		code int
+	}{
+		{"/gh", http.StatusFound},
+		{"/missing", http.StatusNotFound},
+		{"/healthz", http.StatusOK},
+	}
+	for _, tt := range baselines {
+		t.Run("baseline headers on "+tt.path, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodGet, tt.path, nil)
+			rec := httptest.NewRecorder()
+			h.ServeHTTP(rec, req)
+			if rec.Code != tt.code {
+				t.Errorf("status=%d, want %d", rec.Code, tt.code)
+			}
+			if got := rec.Header().Get("X-Content-Type-Options"); got != "nosniff" {
+				t.Errorf("X-Content-Type-Options=%q, want nosniff", got)
+			}
+			if got := rec.Header().Get("Referrer-Policy"); got != "no-referrer" {
+				t.Errorf("Referrer-Policy=%q, want no-referrer", got)
+			}
+		})
+	}
+
+	t.Run("home 404 page has CSP and X-Frame-Options", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodGet, "/", nil)
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+		if got := rec.Header().Get("Content-Security-Policy"); got != "default-src 'none'" {
+			t.Errorf("Content-Security-Policy=%q, want default-src 'none'", got)
+		}
+		if got := rec.Header().Get("X-Frame-Options"); got != "DENY" {
+			t.Errorf("X-Frame-Options=%q, want DENY", got)
 		}
 	})
 }

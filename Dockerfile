@@ -6,7 +6,7 @@ COPY static/ ./static/
 RUN go mod download
 RUN CGO_ENABLED=0 go build -o ./a.out .
 
-FROM docker.io/alpine:latest
+FROM docker.io/alpine:3.23.4
 RUN apk add --no-cache ca-certificates tzdata && \
   update-ca-certificates
 COPY --from=compiler /src/app/a.out /server

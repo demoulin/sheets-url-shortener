@@ -71,7 +71,7 @@ func main() {
 	listenAddr := net.JoinHostPort(addr, port)
 	httpSrv := &http.Server{
 		Addr:              listenAddr,
-		Handler:           recovery(mux),
+		Handler:           recovery(securityHeaders(mux)),
 		ErrorLog:          slog.NewLogLogger(slog.Default().Handler(), slog.LevelError),
 		ReadHeaderTimeout: 5 * time.Second,
 		WriteTimeout:      10 * time.Second,
@@ -186,6 +186,8 @@ func (s *server) home(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.Header().Set("Content-Security-Policy", "default-src 'none'")
+	w.Header().Set("X-Frame-Options", "DENY")
 	w.WriteHeader(http.StatusNotFound)
 	fmt.Fprint(w, `<!DOCTYPE html>
 <html><head><title>Not found</title></head><body>
@@ -265,12 +267,26 @@ func urlMap(in [][]interface{}) URLMap {
 			slog.Warn("skipping invalid URL in sheet", "shortcut", k, "url", v, "err", err)
 			continue
 		}
+		if u.Scheme != "http" && u.Scheme != "https" {
+			slog.Warn("skipping URL with non-http(s) scheme in sheet", "shortcut", k, "scheme", u.Scheme)
+			continue
+		}
 		if _, dup := out[k]; dup {
 			slog.Warn("duplicate shortcut in sheet, overwriting", "shortcut", k)
 		}
 		out[k] = u
 	}
 	return out
+}
+
+// securityHeaders adds baseline security headers to every response.
+// CSP and X-Frame-Options are added per-handler for HTML responses.
+func securityHeaders(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("X-Content-Type-Options", "nosniff")
+		w.Header().Set("Referrer-Policy", "no-referrer")
+		next.ServeHTTP(w, r)
+	})
 }
 
 // recovery wraps a handler with panic recovery. The panic value and full stack
