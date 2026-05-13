@@ -21,6 +21,9 @@ go test ./...
 # Run tests with race detector
 go test -race ./...
 
+# Run tests on Go <1.26 (testing/synctest not yet stable)
+GOEXPERIMENT=synctest go test -race ./...
+
 # Build Docker image
 docker build -t sheets-url-shortener .
 

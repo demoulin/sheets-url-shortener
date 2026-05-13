@@ -92,11 +92,15 @@ type server struct {
 
 type URLMap map[string]*url.URL
 
+type sheetQuerier interface {
+	Query(ctx context.Context) ([][]interface{}, error)
+}
+
 type cachedURLMap struct {
 	mu    sync.RWMutex
 	v     URLMap
 	ttl   time.Duration
-	sheet *sheetsProvider
+	sheet sheetQuerier
 }
 
 // start does an initial synchronous load then refreshes on the TTL interval in
