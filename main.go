@@ -11,6 +11,7 @@ import (
 	"net/url"
 	"os"
 	"os/signal"
+	"runtime/debug"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -70,7 +71,8 @@ func main() {
 	listenAddr := net.JoinHostPort(addr, port)
 	httpSrv := &http.Server{
 		Addr:              listenAddr,
-		Handler:           mux,
+		Handler:           recovery(mux),
+		ErrorLog:          slog.NewLogLogger(slog.Default().Handler(), slog.LevelError),
 		ReadHeaderTimeout: 5 * time.Second,
 		WriteTimeout:      10 * time.Second,
 		IdleTimeout:       60 * time.Second,
@@ -269,6 +271,26 @@ func urlMap(in [][]interface{}) URLMap {
 		out[k] = u
 	}
 	return out
+}
+
+// recovery wraps a handler with panic recovery. The panic value and full stack
+// trace are written as a single JSON log entry so Cloud Error Reporting can
+// group them correctly. net/http's built-in recovery is bypassed this way.
+func recovery(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		defer func() {
+			if p := recover(); p != nil {
+				slog.Error("panic recovered",
+					"panic", fmt.Sprintf("%v", p),
+					"stack", string(debug.Stack()),
+					"method", r.Method,
+					"path", r.URL.Path,
+				)
+				http.Error(w, "internal server error", http.StatusInternalServerError)
+			}
+		}()
+		next.ServeHTTP(w, r)
+	})
 }
 
 func faviconHandler(w http.ResponseWriter, r *http.Request) {
