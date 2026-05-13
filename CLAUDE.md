@@ -15,8 +15,8 @@ GOOGLE_SHEET_ID=<id> go run .
 # Build binary
 CGO_ENABLED=0 go build -o ./a.out .
 
-# Run tests (testing/synctest requires the experiment flag)
-GOEXPERIMENT=synctest go test -race ./...
+# Run tests
+go test -race ./...
 
 # Build Docker image
 docker build -t sheets-url-shortener .
