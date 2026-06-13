@@ -1,7 +1,7 @@
-FROM docker.io/golang:1.26.3 AS compiler
+FROM docker.io/golang:1.26.4 AS compiler
 WORKDIR /src/app
 COPY go.mod go.sum ./
-COPY main.go sheetsprovider.go ./
+COPY *.go ./
 COPY static/ ./static/
 RUN go mod download
 RUN CGO_ENABLED=0 go build -o ./a.out .
