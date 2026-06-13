@@ -44,7 +44,7 @@ The application is split into small single-package files by concern:
 
 **`cache.go`** — `cachedURLMap` (the in-memory TTL cache) and the `urlMap()` row parser:
 - `start()` (called once at boot) does an initial refresh then runs a background `time.Ticker` goroutine that re-fetches every TTL. The server binds and serves immediately; the cache populates asynchronously, so early requests may 404 until the first refresh lands. `Ready()` (a `ready atomic.Bool` set on first successful refresh) backs the `/readyz` probe so the platform can hold traffic until the cache is warm.
-- `doRefresh()` queries Sheets **outside** any lock, then takes a brief write lock only to swap the map pointer — concurrent `Get()`s are not blocked during the Sheets API call.
+- The map is **immutable once published**: `doRefresh()` builds a fresh `URLMap` and atomically swaps it into an `atomic.Pointer[URLMap]`. Reads (`Get()`) are therefore **lock-free and wait-free** — no mutex on the hot path — and scale linearly with cores. `lastUpdate` is an `atomic.Int64` (unix nanos) for the same reason. Do not reintroduce a mutex or mutate the map after publishing it.
 - `kickRefresh()` (run on every `Get()`) fires a one-shot background refresh if the cache is stale and none is already running (guarded by an `atomic.Bool`). This keeps the cache warm under Cloud Run CPU throttling, where the background ticker may not fire between requests.
 - Failed refreshes keep serving stale data (logged, never fatal).
 - `urlMap()` converts raw `[][]interface{}` sheet rows into a `URLMap` (`map[string]*url.URL`). Keys are lowercased; rows with <2 columns, empty cells, unparseable URLs, or non-`http(s)` schemes are skipped with a warning; duplicate shortcuts log a warning and the last one wins.
@@ -77,7 +77,7 @@ The application is split into small single-package files by concern:
 
 - Shortcuts are **case-insensitive** (normalized to lowercase at parse time).
 - Redirects use **302 Found** (never 301) so browsers don't cache them permanently.
-- The cache **never blocks reads on the Sheets API**: the network call happens outside the lock, and only the map-pointer swap is locked. Stale data is served on refresh failure.
+- The cache read path is **lock-free** (`atomic.Pointer[URLMap]`); the published map is never mutated. Reads never block on refresh, and stale data is served on refresh failure.
 - Only `http`/`https` destination URLs are accepted; other schemes are dropped at parse time.
 - Logs are **structured JSON** (`slog`) on stdout for Cloud Logging, using Cloud's field names (`severity`/`message`/`timestamp`) via `newCloudLogger()`; do not switch to plain text or revert the field mapping.
 - `robots.txt` disallows all crawlers; `favicon.ico` is embedded from `static/` via `//go:embed`.

@@ -5,7 +5,6 @@ import (
 	"log/slog"
 	"net/url"
 	"strings"
-	"sync"
 	"sync/atomic"
 	"time"
 )
@@ -18,9 +17,13 @@ type sheetQuerier interface {
 }
 
 type cachedURLMap struct {
-	mu         sync.RWMutex
-	v          URLMap
-	lastUpdate time.Time
+	// v holds the current immutable map. Each refresh builds a fresh map and
+	// atomically swaps the pointer, so reads are lock-free and wait-free.
+	v atomic.Pointer[URLMap]
+
+	// lastUpdate is the unix-nanos timestamp of the last successful refresh
+	// (0 = never refreshed).
+	lastUpdate atomic.Int64
 
 	// refreshing prevents concurrent on-request refresh kicks.
 	refreshing atomic.Bool
@@ -58,10 +61,8 @@ func (c *cachedURLMap) doRefresh(ctx context.Context) {
 		return // keep serving stale data
 	}
 	m := urlMap(rows)
-	c.mu.Lock()
-	c.v = m
-	c.lastUpdate = time.Now()
-	c.mu.Unlock()
+	c.v.Store(&m)
+	c.lastUpdate.Store(time.Now().UnixNano())
 	c.ready.Store(true)
 }
 
@@ -76,9 +77,8 @@ func (c *cachedURLMap) Ready() bool {
 // Cloud Run's default CPU throttling prevents the background goroutine from
 // ticking between requests.
 func (c *cachedURLMap) kickRefresh() {
-	c.mu.RLock()
-	stale := !c.lastUpdate.IsZero() && time.Since(c.lastUpdate) > c.ttl
-	c.mu.RUnlock()
+	last := c.lastUpdate.Load()
+	stale := last != 0 && time.Since(time.Unix(0, last)) > c.ttl
 	if stale && c.refreshing.CompareAndSwap(false, true) {
 		go func() {
 			defer c.refreshing.Store(false)
@@ -89,9 +89,11 @@ func (c *cachedURLMap) kickRefresh() {
 
 func (c *cachedURLMap) Get(key string) *url.URL {
 	c.kickRefresh()
-	c.mu.RLock()
-	defer c.mu.RUnlock()
-	return c.v[key]
+	m := c.v.Load()
+	if m == nil {
+		return nil
+	}
+	return (*m)[key]
 }
 
 // urlMap parses sheet rows into a URLMap. Col A is the shortcut (lowercased),

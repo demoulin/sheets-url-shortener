@@ -180,7 +180,9 @@ func makeTestServer(shortcuts map[string]string) *server {
 		u, _ := url.Parse(v)
 		m[strings.ToLower(k)] = u
 	}
-	return &server{db: &cachedURLMap{v: m}}
+	c := &cachedURLMap{}
+	c.v.Store(&m)
+	return &server{db: c}
 }
 
 func TestFindRedirect(t *testing.T) {
@@ -511,7 +513,8 @@ func TestCachedURLMapConcurrentReads(t *testing.T) {
 	m := make(URLMap)
 	u, _ := url.Parse("https://github.com")
 	m["gh"] = u
-	cache := &cachedURLMap{v: m}
+	cache := &cachedURLMap{}
+	cache.v.Store(&m)
 
 	const goroutines = 50
 	var wg sync.WaitGroup
