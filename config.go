@@ -18,7 +18,8 @@ type config struct {
 }
 
 // loadConfig reads configuration from the environment, applying defaults.
-// It returns an error only for malformed values (currently CACHE_TTL).
+// It returns an error if a required value is missing (GOOGLE_SHEET_ID) or a
+// value is malformed (CACHE_TTL).
 func loadConfig() (config, error) {
 	cfg := config{
 		port:           getenv("PORT", "8080"),
@@ -28,6 +29,10 @@ func loadConfig() (config, error) {
 		homeRedirect:   os.Getenv("HOME_REDIRECT"),
 		projectID:      os.Getenv("GOOGLE_CLOUD_PROJECT"),
 		cacheTTL:       5 * time.Second,
+	}
+
+	if cfg.googleSheetsID == "" {
+		return config{}, fmt.Errorf("GOOGLE_SHEET_ID is required")
 	}
 
 	if v := os.Getenv("CACHE_TTL"); v != "" {

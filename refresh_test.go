@@ -12,11 +12,11 @@ import (
 type mockSheet struct {
 	calls atomic.Int64
 	mu    sync.Mutex
-	rows  [][]interface{}
+	rows  [][]any
 	err   error
 }
 
-func (m *mockSheet) Query(_ context.Context) ([][]interface{}, error) {
+func (m *mockSheet) Query(_ context.Context) ([][]any, error) {
 	m.mu.Lock()
 	rows, err := m.rows, m.err
 	m.mu.Unlock()
@@ -46,7 +46,7 @@ func waitForCalls(t *testing.T, mock *mockSheet, n int64, timeout time.Duration)
 func TestCachedURLMapRefresh(t *testing.T) {
 	const ttl = 20 * time.Millisecond
 
-	mock := &mockSheet{rows: [][]interface{}{{"gh", "https://github.com"}}}
+	mock := &mockSheet{rows: [][]any{{"gh", "https://github.com"}}}
 	cache := &cachedURLMap{ttl: ttl, sheet: mock}
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -76,7 +76,7 @@ func TestCachedURLMapRefresh(t *testing.T) {
 func TestKickRefreshOnStaleCacheEntry(t *testing.T) {
 	const ttl = 20 * time.Millisecond
 
-	mock := &mockSheet{rows: [][]interface{}{{"gh", "https://github.com"}}}
+	mock := &mockSheet{rows: [][]any{{"gh", "https://github.com"}}}
 	cache := &cachedURLMap{ttl: ttl, sheet: mock}
 
 	ctx, cancel := context.WithCancel(context.Background())

@@ -1,18 +1,20 @@
 package main
 
 import (
+	"context"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
 	"strings"
 	"sync"
 	"testing"
+	"time"
 )
 
 func TestURLMap(t *testing.T) {
 	tests := []struct {
 		name      string
-		rows      [][]interface{}
+		rows      [][]any
 		wantKeys  map[string]string // shortcut → expected URL string
 		wantCount int
 	}{
@@ -23,49 +25,49 @@ func TestURLMap(t *testing.T) {
 		},
 		{
 			name:      "valid row",
-			rows:      [][]interface{}{{"gh", "https://github.com"}},
+			rows:      [][]any{{"gh", "https://github.com"}},
 			wantKeys:  map[string]string{"gh": "https://github.com"},
 			wantCount: 1,
 		},
 		{
 			name:      "key normalized to lowercase",
-			rows:      [][]interface{}{{"GH", "https://github.com"}},
+			rows:      [][]any{{"GH", "https://github.com"}},
 			wantKeys:  map[string]string{"gh": "https://github.com"},
 			wantCount: 1,
 		},
 		{
 			name:      "row with fewer than 2 columns skipped",
-			rows:      [][]interface{}{{"gh"}},
+			rows:      [][]any{{"gh"}},
 			wantCount: 0,
 		},
 		{
 			name:      "empty key skipped",
-			rows:      [][]interface{}{{"", "https://example.com"}},
+			rows:      [][]any{{"", "https://example.com"}},
 			wantCount: 0,
 		},
 		{
 			name:      "invalid URL skipped",
-			rows:      [][]interface{}{{"bad", "://missing-scheme"}},
+			rows:      [][]any{{"bad", "://missing-scheme"}},
 			wantCount: 0,
 		},
 		{
 			name:      "javascript scheme rejected",
-			rows:      [][]interface{}{{"xss", "javascript:alert(1)"}},
+			rows:      [][]any{{"xss", "javascript:alert(1)"}},
 			wantCount: 0,
 		},
 		{
 			name:      "relative URL rejected (no scheme)",
-			rows:      [][]interface{}{{"rel", "/internal/path"}},
+			rows:      [][]any{{"rel", "/internal/path"}},
 			wantCount: 0,
 		},
 		{
 			name:      "ftp scheme rejected",
-			rows:      [][]interface{}{{"ftp", "ftp://files.example.com"}},
+			rows:      [][]any{{"ftp", "ftp://files.example.com"}},
 			wantCount: 0,
 		},
 		{
 			name: "duplicate key last wins",
-			rows: [][]interface{}{
+			rows: [][]any{
 				{"gh", "https://github.com"},
 				{"gh", "https://gitlab.com"},
 			},
@@ -74,17 +76,17 @@ func TestURLMap(t *testing.T) {
 		},
 		{
 			name:      "non-string key skipped",
-			rows:      [][]interface{}{{42, "https://example.com"}},
+			rows:      [][]any{{42, "https://example.com"}},
 			wantCount: 0,
 		},
 		{
 			name:      "empty URL value skipped",
-			rows:      [][]interface{}{{"gh", ""}},
+			rows:      [][]any{{"gh", ""}},
 			wantCount: 0,
 		},
 		{
 			name:      "non-string URL value skipped",
-			rows:      [][]interface{}{{"gh", 42}},
+			rows:      [][]any{{"gh", 42}},
 			wantCount: 0,
 		},
 	}
@@ -192,15 +194,15 @@ func TestFindRedirect(t *testing.T) {
 		wantURL string // empty = expect nil
 	}{
 		{"/gh", "https://github.com"},
-		{"/GH", "https://github.com"},            // case-insensitive
+		{"/GH", "https://github.com"}, // case-insensitive
 		{"/gcp", "https://cloud.google.com"},
 		{"/gcp/docs", "https://cloud.google.com/docs"},
 		{"/gcp/a/b/c", "https://cloud.google.com/a/b/c"},
 		{"/gh/extra", "https://github.com/extra"},
 		{"/notfound", ""},
 		{"/gh/sub?foo=bar", "https://github.com/sub?foo=bar"},
-		{"/gh?q=1", "https://github.com?q=1"},           // exact match forwards query params
-		{"/gh/", "https://github.com"},                  // trailing slash collapses to base
+		{"/gh?q=1", "https://github.com?q=1"}, // exact match forwards query params
+		{"/gh/", "https://github.com"},        // trailing slash collapses to base
 	}
 
 	t.Run("exact match beats prefix", func(t *testing.T) {
@@ -307,6 +309,30 @@ func TestHandlers(t *testing.T) {
 		mux.ServeHTTP(rec, req)
 		if rec.Code != http.StatusMethodNotAllowed {
 			t.Errorf("status=%d, want %d", rec.Code, http.StatusMethodNotAllowed)
+		}
+	})
+}
+
+func TestReadyHandler(t *testing.T) {
+	cache := &cachedURLMap{ttl: time.Second, sheet: &mockSheet{}}
+	h := readyHandler(cache)
+
+	t.Run("503 before first refresh", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodGet, "/readyz", nil)
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+		if rec.Code != http.StatusServiceUnavailable {
+			t.Errorf("status=%d, want %d", rec.Code, http.StatusServiceUnavailable)
+		}
+	})
+
+	t.Run("200 after successful refresh", func(t *testing.T) {
+		cache.doRefresh(context.Background())
+		req := httptest.NewRequest(http.MethodGet, "/readyz", nil)
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+		if rec.Code != http.StatusOK {
+			t.Errorf("status=%d, want %d", rec.Code, http.StatusOK)
 		}
 	})
 }

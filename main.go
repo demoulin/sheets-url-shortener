@@ -13,8 +13,8 @@ import (
 )
 
 func main() {
-	// JSON logs so Cloud Logging can parse structured fields.
-	slog.SetDefault(slog.New(slog.NewJSONHandler(os.Stdout, nil)))
+	// JSON logs with Cloud Logging field names (severity/message/timestamp).
+	slog.SetDefault(newCloudLogger())
 
 	cfg, err := loadConfig()
 	if err != nil {
@@ -42,6 +42,7 @@ func main() {
 	mux.HandleFunc("GET /favicon.ico", faviconHandler)
 	mux.HandleFunc("GET /robots.txt", robotsHandler)
 	mux.HandleFunc("GET /healthz", healthHandler)
+	mux.HandleFunc("GET /readyz", readyHandler(cache))
 	// GET-only (HEAD is matched implicitly); other methods get a 405.
 	mux.HandleFunc("GET /", srv.handler)
 

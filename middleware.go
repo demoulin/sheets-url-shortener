@@ -80,15 +80,15 @@ func securityHeaders(next http.Handler) http.Handler {
 }
 
 // recovery wraps a handler with panic recovery. The panic value and full stack
-// trace are written as a single JSON log entry so Cloud Error Reporting can
-// group them correctly. net/http's built-in recovery is bypassed this way.
+// trace go into the log `message` in Go's panic format, and the `@type` marker
+// tags the entry as a Cloud Error Reporting event so it groups correctly.
+// net/http's built-in recovery is bypassed this way.
 func recovery(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		defer func() {
 			if p := recover(); p != nil {
-				slog.Error("panic recovered",
-					"panic", fmt.Sprintf("%v", p),
-					"stack", string(debug.Stack()),
+				slog.Error(fmt.Sprintf("panic recovered: %v\n\n%s", p, debug.Stack()),
+					"@type", reportedErrorType,
 					"method", r.Method,
 					"path", r.URL.Path,
 				)

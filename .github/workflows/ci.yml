@@ -17,6 +17,11 @@ jobs:
         with:
           go-version-file: go.mod
 
+      - name: Lint
+        run: |
+          test -z "$(gofmt -l .)" || { echo "gofmt needed on:"; gofmt -l .; exit 1; }
+          go vet ./...
+
       - name: Build
         run: CGO_ENABLED=0 go build -o /dev/null .
 

@@ -18,7 +18,7 @@ type sheetsProvider struct {
 	sheetName      string
 }
 
-func (s *sheetsProvider) Query(ctx context.Context) ([][]interface{}, error) {
+func (s *sheetsProvider) Query(ctx context.Context) ([][]any, error) {
 	if s.googleSheetsID == "" {
 		return nil, fmt.Errorf("GOOGLE_SHEET_ID not set")
 	}

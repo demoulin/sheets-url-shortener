@@ -14,7 +14,7 @@ import (
 type URLMap map[string]*url.URL
 
 type sheetQuerier interface {
-	Query(ctx context.Context) ([][]interface{}, error)
+	Query(ctx context.Context) ([][]any, error)
 }
 
 type cachedURLMap struct {
@@ -24,6 +24,10 @@ type cachedURLMap struct {
 
 	// refreshing prevents concurrent on-request refresh kicks.
 	refreshing atomic.Bool
+
+	// ready is set once the first refresh succeeds; until then the cache is
+	// empty and the service is not ready to serve real shortcuts.
+	ready atomic.Bool
 
 	ttl   time.Duration
 	sheet sheetQuerier
@@ -58,6 +62,13 @@ func (c *cachedURLMap) doRefresh(ctx context.Context) {
 	c.v = m
 	c.lastUpdate = time.Now()
 	c.mu.Unlock()
+	c.ready.Store(true)
+}
+
+// Ready reports whether the cache has been populated by at least one
+// successful refresh.
+func (c *cachedURLMap) Ready() bool {
+	return c.ready.Load()
 }
 
 // kickRefresh fires a one-shot background refresh when the cache is stale and
@@ -85,7 +96,7 @@ func (c *cachedURLMap) Get(key string) *url.URL {
 
 // urlMap parses sheet rows into a URLMap. Col A is the shortcut (lowercased),
 // col B is the destination URL. Duplicate shortcuts log a warning; last wins.
-func urlMap(in [][]interface{}) URLMap {
+func urlMap(in [][]any) URLMap {
 	out := make(URLMap, len(in))
 	for _, row := range in {
 		if len(row) < 2 {
