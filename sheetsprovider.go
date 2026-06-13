@@ -4,9 +4,14 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"time"
 
 	"google.golang.org/api/sheets/v4"
 )
+
+// queryTimeout bounds a single Sheets API call so a hung request can't wedge
+// the cache refresh loop indefinitely.
+const queryTimeout = 10 * time.Second
 
 type sheetsProvider struct {
 	googleSheetsID string
@@ -28,7 +33,10 @@ func (s *sheetsProvider) Query(ctx context.Context) ([][]interface{}, error) {
 		readRange = s.sheetName + "!" + readRange
 	}
 	slog.Info("querying sheet", "id", s.googleSheetsID, "range", readRange)
-	resp, err := srv.Spreadsheets.Values.Get(s.googleSheetsID, readRange).Do()
+
+	ctx, cancel := context.WithTimeout(ctx, queryTimeout)
+	defer cancel()
+	resp, err := srv.Spreadsheets.Values.Get(s.googleSheetsID, readRange).Context(ctx).Do()
 	if err != nil {
 		return nil, fmt.Errorf("unable to retrieve data from sheet: %w", err)
 	}

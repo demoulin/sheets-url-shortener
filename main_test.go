@@ -244,7 +244,7 @@ func TestHandlers(t *testing.T) {
 	})
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", healthHandler)
-	mux.HandleFunc("/", srv.handler)
+	mux.HandleFunc("GET /", srv.handler)
 
 	t.Run("known shortcut redirects with 302", func(t *testing.T) {
 		req := httptest.NewRequest(http.MethodGet, "/gh", nil)
@@ -298,6 +298,15 @@ func TestHandlers(t *testing.T) {
 		mux.ServeHTTP(rec, req)
 		if rec.Code != http.StatusOK {
 			t.Errorf("status=%d, want %d", rec.Code, http.StatusOK)
+		}
+	})
+
+	t.Run("non-GET method returns 405", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodPost, "/gh", nil)
+		rec := httptest.NewRecorder()
+		mux.ServeHTTP(rec, req)
+		if rec.Code != http.StatusMethodNotAllowed {
+			t.Errorf("status=%d, want %d", rec.Code, http.StatusMethodNotAllowed)
 		}
 	})
 }

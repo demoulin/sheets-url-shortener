@@ -18,6 +18,12 @@ CGO_ENABLED=0 go build -o ./a.out .
 # Run tests
 go test -race ./...
 
+# Run a single test
+go test -race -run TestKickRefreshOnStaleCacheEntry .
+
+# Vulnerability scan (also run in CI)
+go run golang.org/x/vuln/cmd/govulncheck@latest ./...
+
 # Build Docker image
 docker build -t sheets-url-shortener .
 
@@ -30,13 +36,26 @@ There is no linter configuration in this project.
 
 ## Architecture
 
-The entire application is two source files:
+The application is split into small single-package files by concern:
 
-**`main.go`** — HTTP server, caching layer, redirect logic:
-- `cachedURLMap`: wraps `sheetsProvider` with an in-memory TTL cache. On every `Get()`, if the TTL has expired it acquires a write lock and re-fetches from Sheets; otherwise it uses a read lock to serve from cache.
-- `urlMap()`: converts raw `[][]interface{}` sheet rows into `map[string]*url.URL`. Keys are lowercased; duplicate shortcuts log a warning and the last one wins.
+**`main.go`** — bootstrap only: loads config, wires the cache + `server` + middleware chain into an `http.Server`, and handles graceful shutdown via `signal.NotifyContext` + `httpSrv.Shutdown` on SIGTERM/SIGINT. Routes registered here: `GET /favicon.ico`, `GET /robots.txt`, `GET /healthz` (liveness), and `GET /` (catch-all → home or redirect). All routes are GET-only (HEAD matched implicitly); other methods get a 405.
+
+**`config.go`** — `config` struct and `loadConfig()`, which reads all env vars and applies defaults. Returns an error for malformed values (currently a bad `CACHE_TTL`), which `main()` turns into a fatal exit.
+
+**`cache.go`** — `cachedURLMap` (the in-memory TTL cache) and the `urlMap()` row parser:
+- `start()` (called once at boot) does an initial refresh then runs a background `time.Ticker` goroutine that re-fetches every TTL. The server binds and serves immediately; the cache populates asynchronously, so early requests may 404 until the first refresh lands.
+- `doRefresh()` queries Sheets **outside** any lock, then takes a brief write lock only to swap the map pointer — concurrent `Get()`s are not blocked during the Sheets API call.
+- `kickRefresh()` (run on every `Get()`) fires a one-shot background refresh if the cache is stale and none is already running (guarded by an `atomic.Bool`). This keeps the cache warm under Cloud Run CPU throttling, where the background ticker may not fire between requests.
+- Failed refreshes keep serving stale data (logged, never fatal).
+- `urlMap()` converts raw `[][]interface{}` sheet rows into a `URLMap` (`map[string]*url.URL`). Keys are lowercased; rows with <2 columns, empty cells, unparseable URLs, or non-`http(s)` schemes are skipped with a warning; duplicate shortcuts log a warning and the last one wins.
+
+**`redirect.go`** — the `server` type and redirect logic:
 - `findRedirect()`: longest-prefix path matching. For a request path like `/gcp/foo/bar`, it tries `gcp/foo/bar` → `gcp/foo` → `gcp` in order, stopping at the first match. Any unmatched trailing segments are appended to the destination URL via `prepRedirect()`.
-- `prepRedirect()`: merges query parameters from the incoming request into the destination URL and appends extra path segments.
+- `prepRedirect()`: clones the destination URL (never mutates the shared map entry), appends extra path segments, and merges query parameters from the incoming request.
+
+**`middleware.go`** — the middleware chain (applied in `main()`): `requestLogger` → `recovery` → `securityHeaders` → mux. `requestLogger` emits one structured access-log line per request and correlates with Cloud Trace via the `X-Cloud-Trace-Context` header. `recovery` turns panics into a 500 plus a single JSON log entry with the stack (for Cloud Error Reporting). `securityHeaders` sets baseline headers on every response (`home()` in `redirect.go` adds CSP/`X-Frame-Options` for its HTML).
+
+**`handlers.go`** — static/utility handlers (`favicon.ico` embedded from `static/` via `//go:embed`, `robots.txt`, `healthz`).
 
 **`sheetsprovider.go`** — thin wrapper around the Google Sheets API. Reads columns A:B from the configured spreadsheet using Application Default Credentials (ADC). The range becomes `SheetName!A:B` if `SHEET_NAME` is set.
 
@@ -50,12 +69,15 @@ The entire application is two source files:
 | `HOME_REDIRECT` | `""` | URL to redirect `/` to; shows a 404 page if unset |
 | `PORT` | `8080` | HTTP listen port |
 | `LISTEN_ADDR` | `""` | Network interface to bind (empty = all interfaces) |
+| `GOOGLE_CLOUD_PROJECT` | `""` | Project ID; only used to format Cloud Trace log fields |
 
 ## Key Behaviours to Preserve
 
 - Shortcuts are **case-insensitive** (normalized to lowercase at parse time).
 - Redirects use **302 Found** (never 301) so browsers don't cache them permanently.
-- The cache refresh holds a **write lock for the full Sheets API call**, so concurrent requests block during refresh.
+- The cache **never blocks reads on the Sheets API**: the network call happens outside the lock, and only the map-pointer swap is locked. Stale data is served on refresh failure.
+- Only `http`/`https` destination URLs are accepted; other schemes are dropped at parse time.
+- Logs are **structured JSON** (`slog`) on stdout for Cloud Logging; do not switch to plain text.
 - `robots.txt` disallows all crawlers; `favicon.ico` is embedded from `static/` via `//go:embed`.
 
 ## Deployment
